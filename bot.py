@@ -1,8 +1,8 @@
-import asyncio, logging, os, sys, textwrap
+import asyncio, logging, os, sys, textwrap, io
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
@@ -25,15 +25,17 @@ if not all([ACTIVE_TOKEN, GOOGLE_API_KEY, WEBHOOK_URL]):
 
 ALLOWED_USERS = {int(uid.strip()) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid.strip()}
 
-# 2026 Model Alignment
+# Smart Cascades: Best models vs Fast models
 CASCADES = {
     'pro': {
-        'text': ['gemini-3.0-pro', 'gemini-3.0-flash'],
-        'image': ['nano-banana-pro', 'nano-banana']
+        'text': ['gemini-2.5-pro', 'gemini-1.5-pro'],
+        'image': ['imagen-3.0-generate-002', 'imagen-3.0-generate-001'],
+        'edit': ['gemini-2.5-pro']
     },
     'flash': {
-        'text': ['gemini-3.0-flash', 'gemini-2.5-flash'],
-        'image': ['nano-banana', 'imagen-3.0-fast-001']
+        'text': ['gemini-2.5-flash', 'gemini-1.5-flash'],
+        'image': ['imagen-3.0-fast-001', 'imagen-3.0-generate-001'],
+        'edit': ['gemini-2.5-flash']
     }
 }
 
@@ -57,7 +59,19 @@ class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
         if not user or user.id not in ALLOWED_USERS:
-            logging.warning(f"Unauthorized access attempt: {user.id if user else 'Unknown'}")
+            logging.warning(f"Unauthorized access attempt: ID {user.id if user else 'Unknown'}")
+            if isinstance(event, dict): 
+                # Raw update bypassing standard event
+                return
+                
+            msg = data.get("event_update").message
+            if msg:
+                await msg.reply(
+                    f"⛔️ **Доступ запрещен!**\n\n"
+                    f"Извините, но этот бот является приватным. Вы не состоите в белом списке.\n"
+                    f"Ваш Telegram ID: `{user.id}`\n\n"
+                    f"Передайте этот ID администратору бота, чтобы он добавил вас в список доступа."
+                )
             return
         return await handler(event, data)
 
@@ -65,74 +79,287 @@ dp.message.middleware(AuthMiddleware())
 dp.include_router(router)
 
 class BotStates(StatesGroup):
-    waiting_for_input = State()
     waiting_for_gen_prompt = State()
+    waiting_for_edit_photo = State()
+    waiting_for_edit_prompt = State()
+
+# --- KEYBOARDS ---
+def get_main_kb(user_id: int) -> ReplyKeyboardMarkup:
+    current_mode = USER_MODES.get(user_id, 'flash')
+    mode_btn_text = "💎 Режим: PRO (Лучшее качество)" if current_mode == 'pro' else "🚀 Режим: FLASH (Оптимальный)"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎨 Сгенерировать картинку"), KeyboardButton(text="🪄 Изменить фото")],
+            [KeyboardButton(text=mode_btn_text)],
+            [KeyboardButton(text="ℹ️ Помощь")]
+        ],
+        resize_keyboard=True
+    )
+
+cancel_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Отмена")]],
+    resize_keyboard=True
+)
 
 # --- LOGIC ---
-async def generate_with_fallback(models_list: list[str], is_image: bool = False, payload: str = None):
+async def generate_with_fallback(models_list: list[str], contents, is_image: bool = False):
     last_err = None
     for model in models_list:
         try:
             if is_image:
                 return await client.aio.models.generate_image(
                     model=model,
-                    prompt=payload,
-                    config=types.GenerateImageConfig(safety_settings=DEFAULT_SAFETY)
+                    prompt=contents[0] if isinstance(contents, list) else contents,
+                    config=types.GenerateImageConfig(
+                        safety_settings=DEFAULT_SAFETY, 
+                        output_mime_type="image/jpeg",
+                        aspect_ratio="1:1"
+                    )
                 )
+            
+            # Text / Multimodal
             return await client.aio.models.generate_content(
                 model=model,
-                contents=payload,
+                contents=contents,
                 config=types.GenerateContentConfig(safety_settings=DEFAULT_SAFETY)
             )
         except APIError as e:
             last_err = e
-            logging.error(f"Model {model} failed: {e}")
-            if any(code in str(e) for code in ["429", "503", "500"]): continue
+            logging.warning(f"Model {model} API error: {e}")
+            if any(code in str(e) for code in ["429", "503", "500", "400"]): 
+                continue
             break
-    raise last_err or Exception("Cascade exhausted.")
+        except Exception as e:
+            last_err = e
+            logging.error(f"Unexpected error with {model}: {e}")
+            break
+            
+    if last_err is not None:
+        raise last_err
+    raise Exception("Серверы перегружены, попробуйте чуть позже.")
 
 async def handle_response(message: Message, response, is_image: bool = False):
     if is_image:
-        if response.generated_images:
-            img_data = response.generated_images[0].image.data
-            await message.reply_photo(photo=BufferedInputFile(img_data, filename="res.jpg"))
-            return True
+        if hasattr(response, 'generated_images') and response.generated_images:
+            img_obj = response.generated_images[0].image
+            img_data = getattr(img_obj, 'image_bytes', getattr(img_obj, 'data', None))
+            if img_data:
+                await message.reply_photo(photo=BufferedInputFile(img_data, filename="result.jpg"))
+                return True
+        await message.reply("❌ Не удалось сгенерировать изображение. Возможно, ваш промпт был отклонен фильтрами безопасности.")
+        return False
     else:
-        if not response.candidates:
-            await message.answer("⚠️ Safety Blocked.")
+        text = None
+        if hasattr(response, 'text') and response.text:
+            text = response.text
+        elif hasattr(response, 'candidates') and response.candidates:
+            parts = response.candidates[0].content.parts
+            if parts:
+                text = parts[0].text
+                
+        if not text:
+            await message.reply("⚠️ Бот сгенерировал пустой ответ. Это происходит когда Google блокирует контент по соображениям безопасности (NSFW, насилие и тд).")
             return False
-        text = response.candidates[0].content.parts[0].text
+            
         for chunk in textwrap.wrap(text, width=4000):
             await message.answer(chunk)
     return True
 
+async def download_media(file_id: str) -> io.BytesIO:
+    file = await bot.get_file(file_id)
+    out = io.BytesIO()
+    await bot.download_file(file.file_path, out)
+    out.seek(0)
+    return out
+
 # --- HANDLERS ---
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     USER_MODES.setdefault(message.from_user.id, 'flash')
-    await message.answer("Ready.", reply_markup=get_main_kb(message.from_user.id))
+    await message.answer(
+        "👋 **Добро пожаловать в ИИ-ассистент на базе Google Gemini!**\n\n"
+        "Я умею отвечать на вопросы, переводить, писать код, распознавать голосовые сообщения, описывать любые фотографии и рисовать картинки.\n\n"
+        "Для простого общения — просто напишите мне текст, отправьте голосовое или фото с текстом.\n"
+        "Вы можете использовать меню ниже для создания изображений или переключения мощности нейросети.", 
+        reply_markup=get_main_kb(message.from_user.id)
+    )
 
-@router.message(F.text == "🎨 Генерация")
+@router.message(Command("help"))
+@router.message(F.text == "ℹ️ Помощь")
+async def cmd_help(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "💡 **Как мной пользоваться:**\n\n"
+        "✉️ **Текст:** Просто отправьте любой текст, и я на него отвечу.\n"
+        "🎤 **Аудио/Голос:** Отправьте мне голосовое сообщение, и я его расшифрую (и отвечу на вопрос внутри).\n"
+        "👀 **Фотографии:** Отправьте любую фото, и я расскажу что на ней. Вы можете добавить подпись-инструкцию к фото (например: \"переведи этот текст в формат Excel\").\n"
+        "🎨 **Создать картинку:** Нажмите 'Сгенерировать картинку' и опишите то, что хотите увидеть.\n"
+        "🪄 **Изменить фото:** Нажмите 'Изменить фото', чтобы нейросеть проанализировала и креативно дописала или изменила вашу картинку (работает только в бета-режиме).\n\n"
+        "**О переключателе режимов:**\n"
+        "• **Режим FLASH** 🚀 — быстрый, умный, подходит для обычных задач. Экономит ресурсы.\n"
+        "• **Режим PRO** 💎 — использует самую мощную и медленную модель. Используйте для сложных расчетов, тяжелого кода и детальных картинок.",
+        reply_markup=get_main_kb(message.from_user.id)
+    )
+
+@router.message(F.text == "❌ Отмена")
+async def btn_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено. Жду ваших команд!", reply_markup=get_main_kb(message.from_user.id))
+
+@router.message(F.text.in_(["💎 Режим: PRO (Лучшее качество)", "🚀 Режим: FLASH (Оптимальный)"]))
+async def toggle_mode(message: Message):
+    current = USER_MODES.get(message.from_user.id, 'flash')
+    new_mode = 'pro' if current == 'flash' else 'flash'
+    USER_MODES[message.from_user.id] = new_mode
+    
+    mode_name = "💎 PRO-режим (Максимальное качество)" if new_mode == 'pro' else "🚀 FLASH-режим (Баланс скорости и качества)"
+    await message.answer(f"✅ Включен **{mode_name}**.", reply_markup=get_main_kb(message.from_user.id))
+
+# --- IMAGE GENERATION ---
+@router.message(F.text == "🎨 Сгенерировать картинку")
 async def btn_gen(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_gen_prompt)
-    await message.answer("Prompt:", reply_markup=cancel_kb)
+    await message.answer(
+        "📝 Опишите картинку, которую хотите получить. Например:\n"
+        "_«Милый рыжий кот пьет кофе в киберпанк городе»_", 
+        reply_markup=cancel_kb,
+        parse_mode="Markdown"
+    )
 
 @router.message(BotStates.waiting_for_gen_prompt, F.text)
 async def handle_gen(message: Message, state: FSMContext):
-    status = await message.answer("🎨 Rendering...")
+    status = await message.reply("🎨 Рисую изображение... Это займет несколько секунд.")
     try:
         mode = USER_MODES.get(message.from_user.id, 'flash')
-        resp = await generate_with_fallback(CASCADES[mode]['image'], is_image=True, payload=message.text)
+        resp = await generate_with_fallback(CASCADES[mode]['image'], contents=message.text, is_image=True)
         if await handle_response(message, resp, is_image=True):
             await state.clear()
+            await message.answer("✨ Изображение готово!", reply_markup=get_main_kb(message.from_user.id))
     except Exception as e:
-        await message.answer(f"Error: `{e}`")
+        await message.reply(f"❌ Ой, произошла ошибка генерации: `{e}`", reply_markup=get_main_kb(message.from_user.id))
+        await state.clear()
+    finally:
+        await status.delete()
+
+# --- IMAGE EDITING / CREATIVE ANALYSIS ---
+@router.message(F.text == "🪄 Изменить фото")
+async def btn_edit(message: Message, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_edit_photo)
+    await message.answer(
+        "🖼 Отправьте мне фото, которое мы будем анализировать и менять при помощи нейросети.", 
+        reply_markup=cancel_kb
+    )
+
+@router.message(BotStates.waiting_for_edit_photo, F.photo)
+async def handle_edit_photo(message: Message, state: FSMContext):
+    try:
+        photo = message.photo[-1]
+        media_stream = await download_media(photo.file_id)
+        
+        await state.update_data(photo_data=media_stream.read())
+        await state.set_state(BotStates.waiting_for_edit_prompt)
+        await message.answer(
+            "📝 Отлично! Теперь напишите, что сделать с этой картинкой. Например:\n"
+            "_«Одень человека на фото в шляпу»_ или _«Преврати фото в аниме стиль»_",
+            reply_markup=cancel_kb,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await message.reply(f"❌ Проблема с загрузкой фото: `{e}`")
+        await state.clear()
+
+@router.message(BotStates.waiting_for_edit_prompt, F.text)
+async def handle_edit_prompt(message: Message, state: FSMContext):
+    status = await message.reply("🪄 Колдую над вашей картинкой... Ждите.")
+    try:
+        data = await state.get_data()
+        photo_bytes = data['photo_data']
+        
+        contents = [
+            message.text,
+            types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg")
+        ]
+        
+        # We process this via text multimodal capabilities as Imagen out-painting requires complex coordinates natively
+        mode = USER_MODES.get(message.from_user.id, 'flash')
+        resp = await generate_with_fallback(CASCADES[mode]['edit'], contents=contents, is_image=False)
+        await handle_response(message, resp)
+        await state.clear()
+    except Exception as e:
+        await message.reply(f"❌ Не удалось изменить фото: `{e}`")
+        await state.clear()
+    finally:
+        await status.delete()
+
+# --- DEFAULT HANDLERS ---
+@router.message(F.photo)
+async def handle_photo(message: Message, state: FSMContext):
+    await state.clear()
+    status = await message.reply("👀 Смотрю на фото...")
+    try:
+        photo = message.photo[-1]
+        media_stream = await download_media(photo.file_id)
+        
+        prompt = message.caption or "Детально опиши, что изображено на этом изображении."
+        contents = [
+            prompt,
+            types.Part.from_bytes(data=media_stream.read(), mime_type="image/jpeg")
+        ]
+        
+        mode = USER_MODES.get(message.from_user.id, 'flash')
+        resp = await generate_with_fallback(CASCADES[mode]['text'], contents=contents)
+        await handle_response(message, resp)
+    except Exception as e:
+        await message.reply(f"❌ Ой, что-то пошло не так: `{e}`")
+    finally:
+        await status.delete()
+
+@router.message(F.voice | F.audio | F.video | F.document)
+async def handle_media(message: Message, state: FSMContext):
+    await state.clear()
+    
+    if message.document or message.video:
+        await message.reply("📂 Я пока могу работать только с Фотографиями, Аудио и Голосовыми сообщениями. Документы и видео временно не поддерживаются.")
+        return
+
+    status = await message.reply("🎧 Транскрибирую ваше аудио, подождите немного...")
+    try:
+        audio_file = message.voice or message.audio
+        media_stream = await download_media(audio_file.file_id)
+        
+        mime_type = audio_file.mime_type or "audio/ogg"
+        
+        prompt = message.caption or "Сделай транскрибацию этого аудио и кратко резюмируй о чем там говорится."
+        contents = [
+            prompt,
+            types.Part.from_bytes(data=media_stream.read(), mime_type=mime_type)
+        ]
+        
+        mode = USER_MODES.get(message.from_user.id, 'flash')
+        resp = await generate_with_fallback(CASCADES[mode]['text'], contents=contents)
+        await handle_response(message, resp)
+    except Exception as e:
+        await message.reply(f"❌ Ошибка распознавания аудио: `{e}`")
+    finally:
+        await status.delete()
+
+@router.message(F.text)
+async def handle_text(message: Message, state: FSMContext):
+    await state.clear()
+    status = await message.reply("🧠 Думаю...")
+    try:
+        mode = USER_MODES.get(message.from_user.id, 'flash')
+        resp = await generate_with_fallback(CASCADES[mode]['text'], contents=message.text)
+        await handle_response(message, resp)
+    except Exception as e:
+        await message.reply(f"❌ Ошибка сервиса: `{e}`")
     finally:
         await status.delete()
 
 # --- WEBHOOK & HEALTH CHECK ---
 async def handle_index(request):
-    return web.Response(text="Bot is alive", status=200)
+    return web.Response(text="Bot is operational", status=200)
 
 async def on_startup(bot: Bot):
     await bot.set_webhook(f"{WEBHOOK_URL}/webhook", drop_pending_updates=True)
@@ -140,9 +367,10 @@ async def on_startup(bot: Bot):
 def main():
     dp.startup.register(on_startup)
     app = web.Application()
-    app.router.add_get("/", handle_index) # Fix for Render 404
+    app.router.add_get("/", handle_index)
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
+    logging.info(f"Starting webhook server on port {PORT}")
     web.run_app(app, host='0.0.0.0', port=PORT)
 
 if __name__ == "__main__":
