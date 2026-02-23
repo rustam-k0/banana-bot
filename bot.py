@@ -30,12 +30,12 @@ CASCADES = {
     'pro': {
         'text': ['gemini-2.5-pro', 'gemini-1.5-pro'],
         'image': ['imagen-3.0-generate-002', 'imagen-3.0-generate-001'],
-        'edit': ['gemini-2.5-pro']
+        'edit': ['imagen-3.0-generate-002', 'imagen-3.0-generate-001']
     },
     'flash': {
         'text': ['gemini-2.5-flash', 'gemini-1.5-flash'],
         'image': ['imagen-3.0-fast-001', 'imagen-3.0-generate-001'],
-        'edit': ['gemini-2.5-flash']
+        'edit': ['imagen-3.0-fast-001', 'imagen-3.0-generate-001']
     }
 }
 
@@ -61,9 +61,7 @@ class AuthMiddleware(BaseMiddleware):
         if not user or user.id not in ALLOWED_USERS:
             logging.warning(f"Unauthorized access attempt: ID {user.id if user else 'Unknown'}")
             if isinstance(event, dict): 
-                # Raw update bypassing standard event
                 return
-                
             msg = data.get("event_update").message
             if msg:
                 await msg.reply(
@@ -102,27 +100,44 @@ cancel_kb = ReplyKeyboardMarkup(
 )
 
 # --- LOGIC ---
-async def generate_with_fallback(models_list: list[str], contents, is_image: bool = False):
+async def generate_with_fallback(models_list: list[str], contents, is_image: bool = False, image_bytes: bytes | None = None, edit_mode: bool = False):
     last_err = None
     for model in models_list:
         try:
-            if is_image:
+            if edit_mode and image_bytes:
+                # Use edit_image capability
+                raw_ref_image = types.RawReferenceImage(
+                    reference_id=1,
+                    reference_image=types.Image(image_bytes=image_bytes, mime_type="image/jpeg"),
+                )
+                return await client.aio.models.edit_image(
+                    model=model,
+                    prompt=contents,
+                    reference_images=[raw_ref_image],
+                    config=types.EditImageConfig(
+                        edit_mode="EDIT_MODE_DEFAULT",
+                        output_mime_type="image/jpeg"
+                    )
+                )
+
+            elif is_image:
                 return await client.aio.models.generate_images(
                     model=model,
                     prompt=contents[0] if isinstance(contents, list) else contents,
                     config=types.GenerateImagesConfig(
-                        safety_settings=DEFAULT_SAFETY, 
+                        # safety_settings are not supported by the generate_images API yet!
                         output_mime_type="image/jpeg",
                         aspect_ratio="1:1"
                     )
                 )
-            
-            # Text / Multimodal
-            return await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(safety_settings=DEFAULT_SAFETY)
-            )
+            else:
+                # Text / Multimodal
+                return await client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(safety_settings=DEFAULT_SAFETY)
+                )
+
         except APIError as e:
             last_err = e
             logging.warning(f"Model {model} API error: {e}")
@@ -158,7 +173,7 @@ async def handle_response(message: Message, response, is_image: bool = False):
                 text = parts[0].text
                 
         if not text:
-            await message.reply("⚠️ Бот сгенерировал пустой ответ. Это происходит когда Google блокирует контент по соображениям безопасности (NSFW, насилие и тд).")
+            await message.reply("⚠️ Бот сгенерировал пустой ответ. Это происходит когда Google блокирует контент по соображениям безопасности.")
             return False
             
         for chunk in textwrap.wrap(text, width=4000):
@@ -198,10 +213,10 @@ async def cmd_help(message: Message, state: FSMContext):
         "🎤 **Аудио/Голос:** Отправьте мне голосовое сообщение, и я его расшифрую (и отвечу на вопрос внутри).\n"
         "👀 **Фотографии:** Отправьте любую фото, и я расскажу что на ней. Вы можете добавить подпись-инструкцию к фото (например: \"переведи этот текст в формат Excel\").\n"
         "🎨 **Создать картинку:** Нажмите 'Сгенерировать картинку' и опишите то, что хотите увидеть.\n"
-        "🪄 **Изменить фото:** Нажмите 'Изменить фото', чтобы нейросеть проанализировала и креативно дописала или изменила вашу картинку (работает только в бета-режиме).\n\n"
+        "🪄 **Изменить фото:** Нажмите 'Изменить фото', чтобы нейросеть проанализировала и креативно дописала или изменила вашу картинку.\n\n"
         "**О переключателе режимов:**\n"
         "• **Режим FLASH** 🚀 — быстрый, умный, подходит для обычных задач. Экономит ресурсы.\n"
-        "• **Режим PRO** 💎 — использует самую мощную и медленную модель. Используйте для сложных расчетов, тяжелого кода и детальных картинок.",
+        "• **Режим PRO** 💎 — использует самую мощную модель. Используйте для сложных расчетов и детальных картинок.",
         reply_markup=get_main_kb(message.from_user.id)
     )
 
@@ -245,7 +260,7 @@ async def handle_gen(message: Message, state: FSMContext):
     finally:
         await status.delete()
 
-# --- IMAGE EDITING / CREATIVE ANALYSIS ---
+# --- IMAGE EDITING ---
 @router.message(F.text == "🪄 Изменить фото")
 async def btn_edit(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_edit_photo)
@@ -264,7 +279,7 @@ async def handle_edit_photo(message: Message, state: FSMContext):
         await state.set_state(BotStates.waiting_for_edit_prompt)
         await message.answer(
             "📝 Отлично! Теперь напишите, что сделать с этой картинкой. Например:\n"
-            "_«Одень человека на фото в шляпу»_ или _«Преврати фото в аниме стиль»_",
+            "_«Одень человека на фото в шляпу»_ или _«Сделай фон зимним лесом»_",
             reply_markup=cancel_kb,
             parse_mode="Markdown"
         )
@@ -279,18 +294,19 @@ async def handle_edit_prompt(message: Message, state: FSMContext):
         data = await state.get_data()
         photo_bytes = data['photo_data']
         
-        contents = [
-            message.text,
-            types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg")
-        ]
-        
-        # We process this via text multimodal capabilities as Imagen out-painting requires complex coordinates natively
         mode = USER_MODES.get(message.from_user.id, 'flash')
-        resp = await generate_with_fallback(CASCADES[mode]['edit'], contents=contents, is_image=False)
-        await handle_response(message, resp)
-        await state.clear()
+        resp = await generate_with_fallback(
+            models_list=CASCADES[mode]['edit'], 
+            contents=message.text, 
+            is_image=True, 
+            image_bytes=photo_bytes,
+            edit_mode=True
+        )
+        if await handle_response(message, resp, is_image=True):
+            await state.clear()
+            await message.answer("✨ Фото успешно изменено!", reply_markup=get_main_kb(message.from_user.id))
     except Exception as e:
-        await message.reply(f"❌ Не удалось изменить фото: `{e}`")
+        await message.reply(f"❌ Не удалось изменить фото: `{e}`", reply_markup=get_main_kb(message.from_user.id))
         await state.clear()
     finally:
         await status.delete()
