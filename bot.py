@@ -107,10 +107,10 @@ async def generate_with_fallback(models_list: list[str], contents, is_image: boo
     for model in models_list:
         try:
             if is_image:
-                return await client.aio.models.generate_image(
+                return await client.aio.models.generate_images(
                     model=model,
                     prompt=contents[0] if isinstance(contents, list) else contents,
-                    config=types.GenerateImageConfig(
+                    config=types.GenerateImagesConfig(
                         safety_settings=DEFAULT_SAFETY, 
                         output_mime_type="image/jpeg",
                         aspect_ratio="1:1"
@@ -162,7 +162,10 @@ async def handle_response(message: Message, response, is_image: bool = False):
             return False
             
         for chunk in textwrap.wrap(text, width=4000):
-            await message.answer(chunk)
+            try:
+                await message.answer(chunk)
+            except Exception:
+                await message.answer(chunk, parse_mode=None)
     return True
 
 async def download_media(file_id: str) -> io.BytesIO:
@@ -319,8 +322,26 @@ async def handle_photo(message: Message, state: FSMContext):
 async def handle_media(message: Message, state: FSMContext):
     await state.clear()
     
+    if message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
+        status = await message.reply("👀 Смотрю на файл с изображением...")
+        try:
+            media_stream = await download_media(message.document.file_id)
+            prompt = message.caption or "Детально опиши, что изображено на этом изображении."
+            contents = [
+                prompt,
+                types.Part.from_bytes(data=media_stream.read(), mime_type=message.document.mime_type)
+            ]
+            mode = USER_MODES.get(message.from_user.id, 'flash')
+            resp = await generate_with_fallback(CASCADES[mode]['text'], contents=contents)
+            await handle_response(message, resp)
+        except Exception as e:
+            await message.reply(f"❌ Ой, что-то пошло не так: `{e}`")
+        finally:
+            await status.delete()
+        return
+
     if message.document or message.video:
-        await message.reply("📂 Я пока могу работать только с Фотографиями, Аудио и Голосовыми сообщениями. Документы и видео временно не поддерживаются.")
+        await message.reply("📂 Я пока могу работать только с Фотографиями, Аудио и Голосовыми сообщениями. Документы (кроме картинок) и видео временно не поддерживаются.")
         return
 
     status = await message.reply("🎧 Транскрибирую ваше аудио, подождите немного...")
