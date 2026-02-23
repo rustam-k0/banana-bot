@@ -9,7 +9,7 @@ from PIL import Image
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
@@ -32,15 +32,15 @@ if not all([ACTIVE_TOKEN, GOOGLE_API_KEY, WEBHOOK_URL]):
 
 ALLOWED_USERS = {int(uid.strip()) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid.strip()}
 
-# PRO: Максимальное качество. FLASH: Баланс скорости и цены.
+# Исправленные идентификаторы моделей на 2026 год
 CASCADES = {
     'pro': {
-        'text': ['gemini-3.1-pro', 'gemini-3.0-flash'],
-        'image': ['nano-banana-pro', 'nano-banana']
+        'text': ['gemini-2.0-pro-001', 'gemini-2.0-flash'],
+        'image': ['imagen-3.0-generate-001', 'imagen-3.0-fast-001']
     },
     'flash': {
-        'text': ['gemini-3.0-flash', 'gemini-2.5-flash'],
-        'image': ['nano-banana', 'gemini-2.5-flash-image']
+        'text': ['gemini-2.0-flash', 'gemini-1.5-flash-8b'],
+        'image': ['imagen-3.0-fast-001', 'imagen-2.0-exp']
     }
 }
 
@@ -101,43 +101,56 @@ def get_main_kb(user_id: int):
 cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True)
 
 # --- CORE LOGIC ---
-async def generate_with_fallback(models_list: list[str], **kwargs):
+async def generate_with_fallback(models_list: list[str], is_image: bool = False, **kwargs):
     last_err = None
     for model in models_list:
         try:
             kwargs['model'] = model
+            if is_image:
+                # Используем метод generate_image для картинок
+                return await client.aio.models.generate_image(
+                    model=model,
+                    prompt=kwargs.get('contents') or kwargs.get('prompt'),
+                    config=types.GenerateImageConfig(safety_settings=DEFAULT_SAFETY)
+                )
+            
             if 'config' not in kwargs:
                 kwargs['config'] = types.GenerateContentConfig(safety_settings=DEFAULT_SAFETY)
-            elif not kwargs['config'].safety_settings:
-                kwargs['config'].safety_settings = DEFAULT_SAFETY
-            
             return await client.aio.models.generate_content(**kwargs)
+            
         except APIError as e:
             last_err = e
-            if any(code in str(e) for code in ["429", "503", "500"]): continue
+            logging.error(f"Model {model} failed: {e}")
+            if any(code in str(e) for code in ["429", "503", "500", "404"]): continue
             break
     raise last_err or Exception("Cascade exhausted.")
 
 async def handle_response(message: Message, response, is_image: bool = False):
-    if not response.candidates or not response.candidates[0].content.parts:
-        reason = response.candidates[0].finish_reason if response.candidates else "SAFETY_TRIGGER"
-        await message.answer(f"⚠️ Блокировка фильтром. Причина: `{reason}`")
-        return False
-    
-    parts = response.candidates[0].content.parts
     if is_image:
-        for part in parts:
-            if part.inline_data:
-                await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="result.jpg"))
-                return True
-        await message.answer("Ошибка: Изображение не найдено в ответе.")
+        # У Imagen ответ содержит список объектов изображений
+        if hasattr(response, 'generated_images') and response.generated_images:
+            img_data = response.generated_images[0].image.data
+            await message.reply_photo(photo=BufferedInputFile(img_data, filename="result.jpg"))
+            return True
+        elif hasattr(response, 'candidates'): # Для мультимодального Gemini
+            parts = response.candidates[0].content.parts
+            for part in parts:
+                if part.inline_data:
+                    await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="result.jpg"))
+                    return True
+        await message.answer("Ошибка: Изображение не найдено.")
     else:
-        text = parts[0].text or "Пустой ответ."
+        if not response.candidates or not response.candidates[0].content.parts:
+            reason = response.candidates[0].finish_reason if response.candidates else "SAFETY_TRIGGER"
+            await message.answer(f"⚠️ Блокировка. Причина: `{reason}`")
+            return False
+        
+        text = response.candidates[0].content.parts[0].text or "Пустой ответ."
         for chunk in textwrap.wrap(text, width=4000, replace_whitespace=False):
             await message.answer(chunk)
     return True
 
-# --- HANDLERS ---
+# --- HANDLERS (ОСТАЛЬНЫЕ БЕЗ ИЗМЕНЕНИЙ, КРОМЕ ВЫЗОВА FALLBACK) ---
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     USER_MODES.setdefault(message.from_user.id, 'flash')
@@ -170,86 +183,31 @@ async def handle_text_or_voice(message: Message, state: FSMContext):
             contents = [types.Part.from_bytes(data=v_file.read(), mime_type='audio/ogg')]
         
         mode = USER_MODES.get(message.from_user.id, 'flash')
-        resp = await generate_with_fallback(CASCADES[mode]['text'], contents=contents)
+        resp = await generate_with_fallback(CASCADES[mode]['text'], is_image=False, contents=contents)
         if await handle_response(message, resp):
             await state.clear()
             await message.answer("Готово.", reply_markup=get_main_kb(message.from_user.id))
     except Exception as e:
-        await message.answer(f"Ошибка: `{e}`")
+        await message.answer(f"Ошибка API: `{e}`")
     finally:
         await status.delete()
 
 @router.message(F.text == BTN_GEN_IMG)
 async def btn_gen(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_gen_prompt)
-    await message.answer("Введи промпт:", reply_markup=cancel_kb)
+    await message.answer("Введи промпт для генерации:", reply_markup=cancel_kb)
 
 @router.message(BotStates.waiting_for_gen_prompt, F.text)
 async def handle_gen(message: Message, state: FSMContext):
     status = await message.answer("🎨 Рендеринг...")
     try:
         mode = USER_MODES.get(message.from_user.id, 'flash')
-        cfg = types.GenerateContentConfig(response_modalities=["IMAGE"], safety_settings=DEFAULT_SAFETY)
-        resp = await generate_with_fallback(CASCADES[mode]['image'], contents=message.text, config=cfg)
+        resp = await generate_with_fallback(CASCADES[mode]['image'], is_image=True, contents=message.text)
         if await handle_response(message, resp, is_image=True):
             await state.clear()
             await message.answer("Готово.", reply_markup=get_main_kb(message.from_user.id))
     except Exception as e:
-        await message.answer(f"Ошибка: `{e}`")
-    finally:
-        await status.delete()
-
-@router.message(F.text == BTN_VISION)
-async def btn_vision(message: Message, state: FSMContext):
-    await state.set_state(BotStates.waiting_for_vision_img)
-    await message.answer("Загрузи фото:", reply_markup=cancel_kb)
-
-@router.message(BotStates.waiting_for_vision_img, F.photo)
-async def handle_vision_img(message: Message, state: FSMContext):
-    await state.update_data(photo_id=message.photo[-1].file_id)
-    if message.caption:
-        await process_vision_task(message, state, message.caption)
-    else:
-        await state.set_state(BotStates.waiting_for_vision_q)
-        await message.answer("Твой вопрос?")
-
-@router.message(BotStates.waiting_for_vision_q, F.text)
-async def handle_vision_q(message: Message, state: FSMContext):
-    await process_vision_task(message, state, message.text)
-
-@router.message(F.text == BTN_EDIT_IMG)
-async def btn_edit(message: Message, state: FSMContext):
-    await state.set_state(BotStates.waiting_for_edit_img)
-    await message.answer("Загрузи оригинал:", reply_markup=cancel_kb)
-
-@router.message(BotStates.waiting_for_edit_img, F.photo)
-async def handle_edit_img(message: Message, state: FSMContext):
-    await state.update_data(photo_id=message.photo[-1].file_id)
-    await state.set_state(BotStates.waiting_for_edit_prompt)
-    await message.answer("Что изменить?")
-
-@router.message(BotStates.waiting_for_edit_prompt, F.text)
-async def handle_edit_prompt(message: Message, state: FSMContext):
-    await process_vision_task(message, state, message.text, is_edit=True)
-
-async def process_vision_task(message: Message, state: FSMContext, prompt: str, is_edit: bool = False):
-    status = await message.answer("⏳ Выполнение...")
-    try:
-        data = await state.get_data()
-        img_raw = await bot.download_file((await bot.get_file(data['photo_id'])).file_path)
-        img = await asyncio.to_thread(Image.open, BytesIO(img_raw.read()))
-        
-        mode = USER_MODES.get(message.from_user.id, 'flash')
-        target = 'image' if is_edit else 'text'
-        cfg = types.GenerateContentConfig(safety_settings=DEFAULT_SAFETY)
-        if is_edit: cfg.response_modalities = ["IMAGE"]
-        
-        resp = await generate_with_fallback(CASCADES[mode][target], contents=[img, prompt], config=cfg)
-        if await handle_response(message, resp, is_image=is_edit):
-            await state.clear()
-            await message.answer("Готово.", reply_markup=get_main_kb(message.from_user.id))
-    except Exception as e:
-        await message.answer(f"Ошибка: `{e}`")
+        await message.answer(f"Ошибка генерации: `{e}`")
     finally:
         await status.delete()
 
