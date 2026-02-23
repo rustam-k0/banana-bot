@@ -15,17 +15,21 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN_PROD = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN_DEV = os.getenv("TELEGRAM_BOT_TOKEN_DEV")
+ACTIVE_TOKEN = TELEGRAM_BOT_TOKEN_DEV if TELEGRAM_BOT_TOKEN_DEV else TELEGRAM_BOT_TOKEN_PROD
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
 PORT = int(os.getenv("PORT", 8080))
 
-if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
-    sys.exit("CRITICAL: TELEGRAM_BOT_TOKEN или GOOGLE_API_KEY отсутствует.")
+if not ACTIVE_TOKEN or not GOOGLE_API_KEY:
+    sys.exit("CRITICAL: Токен Telegram или GOOGLE_API_KEY отсутствует. Проверь .env.")
 
 ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS_STR.split(",") if uid.strip().isdigit()}
 
@@ -41,7 +45,7 @@ BTN_CANCEL = "❌ Отмена"
 MENU_COMMANDS = [BTN_TEXT_VOICE, BTN_GEN_IMG, BTN_VISION, BTN_EDIT_IMG, BTN_CANCEL]
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
-bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+bot = Bot(token=ACTIVE_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -71,9 +75,23 @@ async def send_long_message(message: Message, text: str):
     for chunk in textwrap.wrap(text, width=4000, replace_whitespace=False):
         await message.answer(chunk)
 
+async def handle_api_error(message: Message, state: FSMContext, exception: Exception):
+    """Централизованная обработка ошибок для избежания утечек трейсбека."""
+    if isinstance(exception, APIError):
+        logging.error(f"Gemini API Error: {exception}")
+        await message.answer("Ошибка API Gemini. Запрос отклонен политикой безопасности или сервис недоступен.")
+    else:
+        logging.error(f"Unexpected Error: {exception}")
+        await message.answer("Внутренняя ошибка сервера при обработке запроса.")
+    await state.clear()
+
 @router.message(~F.from_user.id.in_(ALLOWED_USERS))
 async def unauthorized(message: Message):
-    await message.answer("Доступ закрыт.")
+    user_id = message.from_user.id
+    username = message.from_user.username or "no_username"
+    logging.warning(f"UNAUTHORIZED ACCESS: ID {user_id} | @{username}")
+    # Эта строка уже выполняла требуемую тобой задачу.
+    await message.answer(f"Извини, доступ закрыт.\nТвой ID для запроса доступа: `{user_id}`")
 
 @router.message(F.text == BTN_CANCEL)
 @router.message(Command("cancel"))
@@ -109,11 +127,11 @@ async def handle_text_or_voice(message: Message, state: FSMContext):
 
         response = await client.aio.models.generate_content(model=MODEL_TEXT_VISION, contents=contents)
         await send_long_message(message, response.text)
+        await state.clear()
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+        await handle_api_error(message, state, e)
     finally:
         await status_msg.delete()
-        await state.clear()
 
 @router.message(F.text == BTN_GEN_IMG, StateFilter(None))
 async def btn_gen(message: Message, state: FSMContext):
@@ -133,11 +151,11 @@ async def handle_gen(message: Message, state: FSMContext):
             if part.inline_data:
                 await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="gen.jpg"))
                 break
+        await state.clear()
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+        await handle_api_error(message, state, e)
     finally:
         await status_msg.delete()
-        await state.clear()
 
 @router.message(F.text == BTN_VISION, StateFilter(None))
 async def btn_vision(message: Message, state: FSMContext):
@@ -189,11 +207,11 @@ async def process_image(message: Message, state: FSMContext, prompt: str, photo_
         
         response = await client.aio.models.generate_content(model=model, contents=[img, prompt])
         await send_long_message(message, response.text)
+        await state.clear()
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+        await handle_api_error(message, state, e)
     finally:
         await status_msg.delete()
-        await state.clear()
 
 async def process_edit(message: Message, state: FSMContext, prompt: str, photo_id: str):
     status_msg = await message.answer("Изменяю...")
@@ -211,11 +229,11 @@ async def process_edit(message: Message, state: FSMContext, prompt: str, photo_i
             if part.inline_data:
                 await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="edited.jpg"))
                 break
+        await state.clear()
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+        await handle_api_error(message, state, e)
     finally:
         await status_msg.delete()
-        await state.clear()
 
 @router.message(F.text)
 async def fallback(message: Message):
