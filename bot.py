@@ -1,150 +1,234 @@
 import asyncio
-import io
 import logging
 import os
+import sys
 import textwrap
+from io import BytesIO
 from PIL import Image
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, Message
-import google.generativeai as genai
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
+PORT = int(os.getenv("PORT", 8080))
 
-ALLOWED_USERS = set()
-for uid in ALLOWED_USERS_STR.split(","):
-    uid = uid.strip()
-    if uid.isdigit():
-        ALLOWED_USERS.add(int(uid))
+if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
+    sys.exit("CRITICAL: TELEGRAM_BOT_TOKEN или GOOGLE_API_KEY отсутствует.")
 
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS_STR.split(",") if uid.strip().isdigit()}
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+MODEL_TEXT_VISION = 'gemini-2.5-flash'
+MODEL_IMAGE_GEN = 'gemini-2.5-flash-image'
+
+BTN_TEXT_VOICE = "💬 Написать / Сказать"
+BTN_GEN_IMG = "🎨 Нарисовать"
+BTN_VISION = "👁️ Описать фото"
+BTN_EDIT_IMG = "🖌️ Изменить фото"
+BTN_CANCEL = "❌ Отмена"
+
+MENU_COMMANDS = [BTN_TEXT_VOICE, BTN_GEN_IMG, BTN_VISION, BTN_EDIT_IMG, BTN_CANCEL]
+
+client = genai.Client(api_key=GOOGLE_API_KEY)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+class BotStates(StatesGroup):
+    waiting_for_input = State()
+    waiting_for_gen_prompt = State()
+    waiting_for_vision_img = State()
+    waiting_for_vision_q = State()
+    waiting_for_edit_img = State()
+    waiting_for_edit_prompt = State()
+
+menu_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_TEXT_VOICE), KeyboardButton(text=BTN_GEN_IMG)],
+        [KeyboardButton(text=BTN_VISION), KeyboardButton(text=BTN_EDIT_IMG)],
+        [KeyboardButton(text=BTN_CANCEL)]
+    ],
+    resize_keyboard=True
+)
+cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True)
 
 async def send_long_message(message: Message, text: str):
-    if not text:
-        return
-    for chunk in textwrap.wrap(text, width=4000, replace_whitespace=False, drop_whitespace=False):
+    if not text: return
+    for chunk in textwrap.wrap(text, width=4000, replace_whitespace=False):
         await message.answer(chunk)
 
-@dp.message(~F.from_user.id.in_(ALLOWED_USERS))
-async def unauthorized_access(message: Message):
-    logger.warning(f"Неавторизованная попытка доступа от пользователя: {message.from_user.id}")
-    await message.answer(f"⛔️ Доступ запрещен.\nВаш Telegram ID: `{message.from_user.id}`\n\nПожалуйста, добавьте этот ID в параметр `ALLOWED_USERS` в файле `.env` и перезапустите бота.", parse_mode="Markdown")
-    return
+@router.message(~F.from_user.id.in_(ALLOWED_USERS))
+async def unauthorized(message: Message):
+    await message.answer("Доступ закрыт.")
 
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    await message.answer(
-        "Привет! Я твой ИИ-ассистент на базе Google Gemini.\n\n"
-        "Отправь мне текст, фото или используй `/img <запрос>` для генерации картинки.",
-        parse_mode="Markdown"
-    )
+@router.message(F.text == BTN_CANCEL)
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=menu_kb)
 
-@dp.message(Command("img"))
-async def handle_image_generation(message: Message):
-    prompt = message.text.replace("/img", "", 1).strip()
-    if not prompt:
-        await message.answer("Пожалуйста, укажите запрос. Пример: `/img киберпанк город`", parse_mode="Markdown")
-        return
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Привет. Выбирай действие.", reply_markup=menu_kb)
 
-    status_msg = await message.answer("🎨 Генерирую картинку...")
+@router.message(F.text.in_(MENU_COMMANDS), ~StateFilter(None))
+async def handle_menu_in_state(message: Message, state: FSMContext):
+    await state.clear()
+    return await dp.feed_update(bot, message.model_copy(update={"text": message.text}))
+
+@router.message(F.text == BTN_TEXT_VOICE, StateFilter(None))
+async def btn_text_voice(message: Message, state: FSMContext):
+    await message.answer("Жду текст или войс:", reply_markup=cancel_kb)
+    await state.set_state(BotStates.waiting_for_input)
+
+@router.message(BotStates.waiting_for_input, F.text | F.voice)
+async def handle_text_or_voice(message: Message, state: FSMContext):
+    status_msg = await message.answer("Думаю...")
     try:
-        imagen = genai.ImageGenerationModel("imagen-3.0-generate-001")
-        result = imagen.generate_images(prompt=prompt, number_of_images=1, aspect_ratio="1:1")
-        
-        for generated_image in result.images:
-            img_byte_arr = io.BytesIO()
-            generated_image.image.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
-            
-            photo = BufferedInputFile(img_byte_arr.getvalue(), filename="generated.png")
-            await message.reply_photo(photo=photo, caption=f"Запрос: {prompt}")
-            break
-            
-        await status_msg.delete()
-        
-    except Exception as e:
-        logger.error(f"Image generation failed: {e}")
-        error_str = str(e).lower()
-        if "timeout" in error_str:
-            await status_msg.edit_text("❌ Запрос превысил время ожидания. Попробуйте позже.")
-        elif "safety" in error_str or "block" in error_str:
-            await status_msg.edit_text("❌ Запрос заблокирован фильтрами безопасности.")
-        elif "quota" in error_str or "limit" in error_str:
-            await status_msg.edit_text("❌ Лимит запросов исчерпан. Попробуйте позже.")
+        if message.voice:
+            file_info = await bot.get_file(message.voice.file_id)
+            voice_file = await bot.download_file(file_info.file_path)
+            contents = [types.Part.from_bytes(data=voice_file.read(), mime_type='audio/ogg')]
         else:
-            await status_msg.edit_text("❌ Произошла ошибка при генерации изображения.")
+            contents = message.text
 
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    status_msg = await message.answer("👁️ Анализирую изображение...")
-    try:
-        photo_info = message.photo[-1]
-        file_info = await bot.get_file(photo_info.file_id)
-        
-        downloaded_file = await bot.download_file(file_info.file_path)
-        img = Image.open(downloaded_file)
-        
-        prompt = message.caption if message.caption else "Опиши это изображение в деталях."
-        
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content([prompt, img])
-        
-        await status_msg.delete()
+        response = await client.aio.models.generate_content(model=MODEL_TEXT_VISION, contents=contents)
         await send_long_message(message, response.text)
-        
     except Exception as e:
-        logger.error(f"Vision analysis failed: {e}")
-        error_str = str(e).lower()
-        if "timeout" in error_str:
-            await status_msg.edit_text("❌ Запрос превысил время ожидания.")
-        elif "safety" in error_str or "block" in error_str:
-            await status_msg.edit_text("❌ Изображение заблокировано фильтрами безопасности.")
-        else:
-            await status_msg.edit_text("❌ Ошибка при обработке изображения.")
-
-@dp.message(F.text)
-async def handle_text(message: Message):
-    status_msg = await message.answer("💬 Думаю...")
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(message.text)
-        
+        await message.answer(f"Ошибка: {e}")
+    finally:
         await status_msg.delete()
-        await send_long_message(message, response.text)
-        
+        await state.clear()
+
+@router.message(F.text == BTN_GEN_IMG, StateFilter(None))
+async def btn_gen(message: Message, state: FSMContext):
+    await message.answer("Промпт для генерации:", reply_markup=cancel_kb)
+    await state.set_state(BotStates.waiting_for_gen_prompt)
+
+@router.message(BotStates.waiting_for_gen_prompt, F.text)
+async def handle_gen(message: Message, state: FSMContext):
+    status_msg = await message.answer("Рисую...")
+    try:
+        response = await client.aio.models.generate_content(
+            model=MODEL_IMAGE_GEN,
+            contents=message.text,
+            config=types.GenerateContentConfig(response_modalities=["IMAGE"], image_config=types.ImageConfig(aspect_ratio="1:1"))
+        )
+        for part in response.parts:
+            if part.inline_data:
+                await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="gen.jpg"))
+                break
     except Exception as e:
-        logger.error(f"Text generation failed: {e}")
-        error_str = str(e).lower()
-        if "timeout" in error_str:
-            await status_msg.edit_text("❌ Запрос превысил время ожидания.")
-        elif "safety" in error_str or "block" in error_str:
-            await status_msg.edit_text("❌ Сообщение заблокировано фильтрами безопасности.")
-        elif "quota" in error_str or "limit" in error_str:
-            await status_msg.edit_text("❌ Лимит запросов исчерпан. Попробуйте позже.")
-        else:
-            await status_msg.edit_text("❌ Ошибка при генерации ответа.")
+        await message.answer(f"Ошибка: {e}")
+    finally:
+        await status_msg.delete()
+        await state.clear()
+
+@router.message(F.text == BTN_VISION, StateFilter(None))
+async def btn_vision(message: Message, state: FSMContext):
+    await message.answer("Кидай фото:", reply_markup=cancel_kb)
+    await state.set_state(BotStates.waiting_for_vision_img)
+
+@router.message(BotStates.waiting_for_vision_img, F.photo)
+async def handle_vision_img(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    if message.caption:
+        await process_image(message, state, message.caption, photo_id, MODEL_TEXT_VISION)
+    else:
+        await state.update_data(photo_id=photo_id)
+        await message.answer("Что рассказать про фото?", reply_markup=cancel_kb)
+        await state.set_state(BotStates.waiting_for_vision_q)
+
+@router.message(BotStates.waiting_for_vision_q, F.text | F.voice)
+async def handle_vision_q(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prompt = message.text or "Опиши это." 
+    await process_image(message, state, prompt, data['photo_id'], MODEL_TEXT_VISION)
+
+@router.message(F.text == BTN_EDIT_IMG, StateFilter(None))
+async def btn_edit(message: Message, state: FSMContext):
+    await message.answer("Кидай фото для изменения:", reply_markup=cancel_kb)
+    await state.set_state(BotStates.waiting_for_edit_img)
+
+@router.message(BotStates.waiting_for_edit_img, F.photo)
+async def handle_edit_img(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    if message.caption:
+        await process_edit(message, state, message.caption, photo_id)
+    else:
+        await state.update_data(photo_id=photo_id)
+        await message.answer("Что изменить?", reply_markup=cancel_kb)
+        await state.set_state(BotStates.waiting_for_edit_prompt)
+
+@router.message(BotStates.waiting_for_edit_prompt, F.text)
+async def handle_edit_prompt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await process_edit(message, state, message.text, data['photo_id'])
+
+async def process_image(message: Message, state: FSMContext, prompt: str, photo_id: str, model: str):
+    status_msg = await message.answer("Смотрю...")
+    try:
+        file_info = await bot.get_file(photo_id)
+        img_file = await bot.download_file(file_info.file_path)
+        img = await asyncio.to_thread(Image.open, BytesIO(img_file.read()))
+        
+        response = await client.aio.models.generate_content(model=model, contents=[img, prompt])
+        await send_long_message(message, response.text)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    finally:
+        await status_msg.delete()
+        await state.clear()
+
+async def process_edit(message: Message, state: FSMContext, prompt: str, photo_id: str):
+    status_msg = await message.answer("Изменяю...")
+    try:
+        file_info = await bot.get_file(photo_id)
+        img_file = await bot.download_file(file_info.file_path)
+        img = await asyncio.to_thread(Image.open, BytesIO(img_file.read()))
+        
+        response = await client.aio.models.generate_content(
+            model=MODEL_IMAGE_GEN,
+            contents=[img, prompt],
+            config=types.GenerateContentConfig(response_modalities=["IMAGE"])
+        )
+        for part in response.parts:
+            if part.inline_data:
+                await message.reply_photo(photo=BufferedInputFile(part.inline_data.data, filename="edited.jpg"))
+                break
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    finally:
+        await status_msg.delete()
+        await state.clear()
+
+@router.message(F.text)
+async def fallback(message: Message):
+    await message.answer("Не понял. Жми кнопки.", reply_markup=menu_kb)
 
 async def main():
-    if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
-        logger.error("Отсутствуют необходимые API ключи в .env")
-        return
-    if not ALLOWED_USERS:
-        logger.warning("Список ALLOWED_USERS пуст! Бот будет игнорировать всех.")
-        
-    logger.info("Бот запущен...")
+    app = web.Application()
+    app.router.add_get('/', lambda request: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
