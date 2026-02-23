@@ -62,16 +62,12 @@ if not ALLOWED_USERS:
 #
 # Каскад: если первая модель вернёт ошибку (429/500/503),
 # бот переключится на следующую.
-#
-# Для изображений используется единая модель
-# gemini-2.5-flash-image через generate_content
-# с response_modalities=["IMAGE"].
 # ═══════════════════════════════════════════════════════════
 
 CASCADES = {
     "pro": {
-        "text": ["gemini-2.5-pro", "gemini-2.5-flash"],
-        "image": ["gemini-2.5-flash-image"],
+        "text": ["gemini-3.1-pro", "gemini-2.5-flash"],
+        "image": ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"],
     },
     "flash": {
         "text": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
@@ -768,8 +764,8 @@ async def handle_text(message: Message, state: FSMContext):
 # ЗАПУСК БОТА
 # ═══════════════════════════════════════════════════════════
 
-async def on_startup(bot_instance: Bot):
-    """Устанавливает webhook при старте."""
+async def on_startup(bot_instance: Bot, **kwargs):
+    """Устанавливает webhook при старте (вызывается из dp.startup)."""
     await bot_instance.set_webhook(
         f"{WEBHOOK_URL}/webhook",
         drop_pending_updates=True,
@@ -780,19 +776,19 @@ async def on_startup(bot_instance: Bot):
 def main():
     """
     Точка входа:
-    - Если задан WEBHOOK_URL → запуск через webhook + aiohttp
-    - Если WEBHOOK_URL пуст → запуск через polling (удобно для разработки)
+    - Если задан WEBHOOK_URL → запуск через webhook + aiohttp (Render)
+    - Если WEBHOOK_URL пуст → запуск через polling (локальная разработка)
     """
     if WEBHOOK_URL:
-        # ── WEBHOOK-РЕЖИМ ──
+        # ── WEBHOOK-РЕЖИМ (Render, Railway, Heroku) ──
         from aiohttp import web
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-        dp.startup.register(on_startup)
         app = web.Application()
         app.router.add_get("/", lambda r: web.Response(text="Banana Bot is running 🍌"))
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
-        setup_application(app, dp, bot=bot)
+        setup_application(app, dp, bot=bot)  # это передаёт bot в on_startup
+        dp.startup.register(on_startup)
 
         log.info(f"🚀 Запуск в WEBHOOK-режиме на порту {PORT}")
         web.run_app(app, host="0.0.0.0", port=PORT)
