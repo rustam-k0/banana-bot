@@ -337,15 +337,17 @@ async def main():
     if WEBHOOK_URL:
         logging.info(f"Запуск Webhook на порту {PORT}")
         app = web.Application()
+        # secret_token допускает только A-Z, a-z, 0-9, _ и -
+        webhook_secret = TELEGRAM_BOT_TOKEN.replace(":", "")
         webhook_requests_handler = SimpleRequestHandler(
             dispatcher=dp,
             bot=bot,
-            secret_token=TELEGRAM_BOT_TOKEN
+            secret_token=webhook_secret
         )
         webhook_requests_handler.register(app, path="/webhook")
         setup_application(app, dp, bot=bot)
         
-        await bot.set_webhook(f"{WEBHOOK_URL}/webhook", secret_token=TELEGRAM_BOT_TOKEN)
+        await bot.set_webhook(f"{WEBHOOK_URL}/webhook", secret_token=webhook_secret)
         
         runner = web.AppRunner(app)
         await runner.setup()
