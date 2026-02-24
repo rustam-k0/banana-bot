@@ -58,11 +58,11 @@ else:
 # ==========================================
 # КОНСТАНТЫ И СОСТОЯНИЯ
 # ==========================================
-BTN_ART = "🎨 Сгенерировать картинку"
-BTN_EDIT = "🪄 Изменить фото"
-BTN_HELP = "ℹ️ Помощь"
-BTN_MODE_PRO = "💎 Режим: PRO (Детальный)"
-BTN_MODE_FLASH = "🚀 Режим: FLASH (Быстрый)"
+BTN_ART = "🎨 Нарисовать"
+BTN_EDIT = "🪄 Изменить"
+BTN_HELP = "ℹ️ Справка"
+BTN_MODE_PRO = "💎 Качество (PRO)"
+BTN_MODE_FLASH = "🚀 Скорость (FLASH)"
 
 # In-memory fallbacks
 user_modes: Dict[int, str] = {}
@@ -75,8 +75,8 @@ IMAGE_GEN_MODELS = {
 }
 
 IMAGE_EDIT_MODELS = {
-    "PRO": ["gemini-3.1-pro-preview"],
-    "FLASH": ["gemini-3-flash-preview"]
+    "PRO": ["gemini-3-pro-image-preview"],
+    "FLASH": ["gemini-2.5-flash-image"]
 }
 
 TEXT_AUDIO_MODELS = {
@@ -192,8 +192,8 @@ async def cmd_start(message: Message):
     await clear_user_action(user_id)
     await clear_user_edit_image(user_id)
     text = (
-        "👋 Привет! Я — бот-робот для работы с изображениями.\n\n"
-        "Выберите действие на клавиатуре ниже:"
+        "👋 Привет! Я — нейросеть для работы с картинками.\n\n"
+        "Выберите действие в меню ниже:"
     )
     kb = await get_main_keyboard(user_id)
     await message.answer(text, reply_markup=kb)
@@ -203,9 +203,8 @@ async def cmd_art(message: Message):
     user_id = message.from_user.id
     await set_user_action(user_id, "WAITING_ART")
     text = (
-        "С удовольствием! Я готов создать для вас изображение.\n\n"
-        "**Что бы вы хотели увидеть на картинке?**\n\n"
-        "Опишите вашу идею как можно подробнее (объекты, стиль, атмосфера, цвета). Чем детальнее запрос, тем лучше результат!"
+        "🎨 **Что нарисуем?**\n\n"
+        "Опишите идею детально: объекты, стиль, цвета. Чем подробнее — тем круче результат!"
     )
     kb = await get_main_keyboard(user_id)
     await message.answer(text, reply_markup=kb)
@@ -215,17 +214,17 @@ async def cmd_edit(message: Message):
     user_id = message.from_user.id
     await set_user_action(user_id, "WAITING_EDIT_PHOTO")
     kb = await get_main_keyboard(user_id)
-    await message.answer("🪄 Отправьте мне **фотографию**, которую нужно изменить.", reply_markup=kb)
+    await message.answer("🪄 Отправьте **фото**, которое нужно изменить.", reply_markup=kb)
 
 @dp.message(F.text == BTN_HELP)
 async def cmd_help(message: Message):
     user_id = message.from_user.id
     await clear_user_action(user_id)
     text = (
-        "ℹ️ **Справка по боту**\n\n"
-        "• **Сгенерировать картинку** — Нажмите кнопку, затем отправьте текстовое описание, и я нарисую изображение.\n"
-        "• **Изменить фото** — Нажмите кнопку, отправьте фото, затем текст с инструкциями, и я внесу изменения.\n"
-        "• **Смена режима** — Нажмите на кнопку с ракетой/алмазом, чтобы переключаться между быстрым (FLASH) и детальным (PRO) режимами."
+        "ℹ️ **Команды**\n\n"
+        "• **Нарисовать** — отправьте описание, и я создам картинку с нуля.\n"
+        "• **Изменить** — отправьте фото + инструкцию того, что нужно поменять.\n"
+        "• **Режимы** — переключение между скоростью (FLASH) и крутой детализацией (PRO)."
     )
     kb = await get_main_keyboard(user_id)
     await message.answer(text, reply_markup=kb)
@@ -235,14 +234,14 @@ async def cmd_set_pro(message: Message):
     user_id = message.from_user.id
     await set_user_mode(user_id, "PRO")
     kb = await get_main_keyboard(user_id)
-    await message.answer("💎 Режим PRO активирован! Качество улучшено.", reply_markup=kb)
+    await message.answer("💎 Включен режим PRO: максимум деталей и качества.", reply_markup=kb)
 
 @dp.message(F.text == BTN_MODE_FLASH)
 async def cmd_set_flash(message: Message):
     user_id = message.from_user.id
     await set_user_mode(user_id, "FLASH")
     kb = await get_main_keyboard(user_id)
-    await message.answer("Принято! ⚡ FLASH-режим. Максимальная скорость. Жду задачу.", reply_markup=kb)
+    await message.answer("🚀 Включен режим FLASH: максимальная скорость.", reply_markup=kb)
 
 # ==========================================
 # ФУНКЦИИ ГЕНЕРАЦИИ ЧЕРЕЗ GEMINI
@@ -268,17 +267,17 @@ async def generate_image_cascade(prompt: str, mode: str, message: Message) -> by
         except APIError as e:
             logging.error(f"API Error с моделью рисования {model_name}: {e}")
             if e.code == 400:
-                await message.answer("❌ Запрос отклонен политикой безопасности (ошибка 400).")
+                await message.answer("❌ Запрос отклонен фильтром безопасности.")
                 break
             elif e.code == 429 or e.code >= 500:
                 continue
             else:
-                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                await message.answer(f"❌ Ошибка сервера: {e.code}")
                 break
         except Exception as e:
             logging.error(f"Ошибка с моделью рисования {model_name}: {e}")
             continue
-    await message.answer("❌ Ошибка генерации: сервис создания картинок временно перегружен или недоступен.")
+    await message.answer("❌ Сервис недоступен. Попробуйте позже.")
     return None
 
 async def edit_image(image_bytes: bytes, prompt: str, mode: str, message: Message) -> bytes | None:
@@ -306,17 +305,17 @@ async def edit_image(image_bytes: bytes, prompt: str, mode: str, message: Messag
         except APIError as e:
             logging.error(f"API Error с моделью изменения {model_name}: {e}")
             if e.code == 400:
-                await message.answer("❌ Запрос отклонен политикой безопасности (ошибка 400).")
+                await message.answer("❌ Запрос отклонен фильтром безопасности.")
                 break
             elif e.code == 429 or e.code >= 500:
                 continue
             else:
-                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                await message.answer(f"❌ Ошибка сервера: {e.code}")
                 break
         except Exception as e:
             logging.error(f"Ошибка с моделью изменения {model_name}: {e}")
             continue
-    await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
+    await message.answer("❌ Сервис недоступен. Попробуйте позже.")
     return None
 
 async def transcribe_audio(audio_bytes: bytes, mode: str, message: Message) -> str | None:
@@ -337,17 +336,17 @@ async def transcribe_audio(audio_bytes: bytes, mode: str, message: Message) -> s
         except APIError as e:
             logging.error(f"API Error с текстовой моделью {model_name}: {e}")
             if e.code == 400:
-                await message.answer("❌ Голосовое сообщение отклонено политикой безопасности (ошибка 400).")
+                await message.answer("❌ Аудио отклонено фильтром безопасности.")
                 break
             elif e.code == 429 or e.code >= 500:
                 continue
             else:
-                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                await message.answer(f"❌ Ошибка сервера: {e.code}")
                 break
         except Exception as e:
             logging.error(f"Ошибка с текстовой моделью {model_name}: {e}")
             continue
-    await message.answer("❌ Ошибка транскрибации: сервис временно перегружен или недоступен.")
+    await message.answer("❌ Сервис транскрибации временно недоступен.")
     return None
 
 # ==========================================
@@ -370,11 +369,11 @@ async def process_user_text_input(text: str, message: Message, bot: Bot):
     elif action == "WAITING_EDIT_PROMPT":
         image_bytes = await get_user_edit_image(user_id)
         if not image_bytes:
-            await message.answer("⚠️ Ошибка: фотография не найдена. Попробуйте нажать кнопку '🪄 Изменить фото' заново.")
+            await message.answer("⚠️ Фото потерялось. Нажмите «🪄 Изменить» и отправьте заново.")
             await clear_user_action(user_id)
             return
 
-        msg = await message.answer("⏳ Волшебство в процессе (изменяю картинку)...")
+        msg = await message.answer("⏳ Колдую над фото...")
         edited_image_bytes = await edit_image(image_bytes, text, mode, message)
         if edited_image_bytes:
             await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
@@ -383,11 +382,11 @@ async def process_user_text_input(text: str, message: Message, bot: Bot):
         await msg.delete()
 
     elif action == "WAITING_EDIT_PHOTO":
-        await message.answer("⚠️ Я жду от вас **фотографию**, а не текст. Отправьте картинку!")
+        await message.answer("⚠️ Отправьте **фото**, а не текст.")
 
     else:
         # Если статус не задан (бот возвращает хардкод загулшку)
-        await message.answer("👆 Пожалуйста, выберите действие на клавиатуре ниже (нарисовать картинку или изменить фото).")
+        await message.answer("👆 Выберите действие в меню: нарисовать или изменить фото.")
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -400,11 +399,11 @@ async def handle_user_voice(message: Message, bot: Bot):
     action = await get_user_action(user_id)
 
     if action == "WAITING_EDIT_PHOTO":
-        await message.answer("⚠️ Я жду от вас **фотографию**, а не голосовое сообщение. Отправьте картинку!")
+        await message.answer("⚠️ Отправьте **фото**, а не голосовое сообщение.")
         return
         
     if not action:
-        await message.answer("👆 Сначала выберите действие на клавиатуре ниже (нарисовать картинку или изменить фото).")
+        await message.answer("👆 Сначала выберите действие в меню.")
         return
 
     msg = await message.answer("⏳ Слушаю...")
@@ -421,7 +420,7 @@ async def handle_user_voice(message: Message, bot: Bot):
 
     if text:
         # Отобразим пользователю, как мы поняли его голосовое, для ясности (но это опционально, можно сразу передать дальше)
-        await message.answer(f"🎙 *Распознано:* {text}", parse_mode=ParseMode.MARKDOWN)
+        await message.answer(f"🎙 *Текст:* {text}", parse_mode=ParseMode.MARKDOWN)
         await process_user_text_input(text, message, bot)
 
 @dp.message(F.photo)
@@ -430,7 +429,7 @@ async def handle_user_photo(message: Message, bot: Bot):
     action = await get_user_action(user_id)
     
     if action == "WAITING_EDIT_PHOTO":
-        msg = await message.answer("Загружаю фото...")
+        msg = await message.answer("⏳ Загружаю фото...")
         
         file_id = message.photo[-1].file_id
         file = await bot.get_file(file_id)
@@ -441,20 +440,20 @@ async def handle_user_photo(message: Message, bot: Bot):
         await set_user_action(user_id, "WAITING_EDIT_PROMPT")
         
         await msg.delete()
-        await message.answer("📸 Фото получено! Теперь отправьте текстом (или голосовым), что именно нужно на нём изменить.")
+        await message.answer("📸 Готово! Что нужно изменить? (текстом или кружочком)")
         
     elif action == "WAITING_EDIT_PROMPT":
-         await message.answer("⚠️ Фото уже получено. Отправьте **текст**, описывающий необходимые изменения.")
+         await message.answer("⚠️ Фото уже у меня. Теперь напишите, что изменить.")
 
     elif action == "WAITING_ART":
-        await message.answer("⚠️ Для генерации новой картинки нужен **текст** (описание), а не фото. Отправьте словесное описание для Арта.")
+        await message.answer("⚠️ Чтобы нарисовать с нуля, отправьте текст, а не фото.")
         
     else:
-        await message.answer("👆 Выберите действие '🪄 Изменить фото' на клавиатуре перед отправкой фотографий.")
+        await message.answer("👆 Нажмите «🪄 Изменить» перед отправкой фото.")
 
 @dp.message()
 async def handle_other_media(message: Message):
-    await message.answer("⚠️ Я работаю только с текстом, голосовыми и обычными фотографиями. Пожалуйста, используйте кнопки.")
+    await message.answer("⚠️ Понимаю только обычные фото, текст и аудио.")
 
 
 # ==========================================
