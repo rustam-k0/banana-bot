@@ -108,7 +108,7 @@ IMAGE_EDIT_MODELS = {
 }
 
 TEXT_AUDIO_MODELS = {
-    "PRO": ["gemini-3.1-pro-preview"],
+    "PRO": ["gemini-3-flash-preview"],
     "FLASH": ["gemini-3-flash-preview"]
 }
 
