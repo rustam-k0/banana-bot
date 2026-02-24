@@ -13,7 +13,9 @@ from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+from google.genai.errors import APIError
 from typing import Dict
+import redis.asyncio as redis
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -23,6 +25,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 ALLOWED_USERS_ENV = os.getenv("ALLOWED_USERS", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8080))
+REDIS_URL = os.getenv("REDIS_URL")
 
 # Парсим ID разрешенных пользователей
 ALLOWED_USERS = set()
@@ -40,6 +43,18 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=Pars
 dp = Dispatcher()
 gemini_client = genai.Client(api_key=GOOGLE_API_KEY, http_options={"api_version": "v1alpha"})
 
+# Настройка Redis
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=False)
+        logging.info("Redis подключен для хранения состояний.")
+    except Exception as e:
+        logging.error(f"Ошибка при подключении к Redis: {e}")
+        redis_client = None
+else:
+    redis_client = None
+    logging.info("REDIS_URL не найден, используется in-memory хранилище (ВНИМАНИЕ: данные сбросятся при рестарте).")
+
 # ==========================================
 # КОНСТАНТЫ И СОСТОЯНИЯ
 # ==========================================
@@ -49,24 +64,103 @@ BTN_HELP = "ℹ️ Помощь"
 BTN_MODE_PRO = "💎 Режим: PRO (Детальный)"
 BTN_MODE_FLASH = "🚀 Режим: FLASH (Быстрый)"
 
-# user_id -> mode ("PRO" или "FLASH")
+# In-memory fallbacks
 user_modes: Dict[int, str] = {}
-# user_id -> action ("WAITING_ART" | "WAITING_EDIT_PHOTO" | "WAITING_EDIT_PROMPT" | None)
 user_actions: Dict[int, str] = {}
-# user_id -> bytes (Временное хранилище фото для изменения)
 user_edit_images: Dict[int, bytes] = {}
 
-MODES = {
+IMAGE_GEN_MODELS = {
     "PRO": ["gemini-3-pro-image-preview", "gemini-3.1-pro-preview"],
     "FLASH": ["gemini-2.5-flash-image", "gemini-3-flash"]
 }
 
-def get_user_mode(user_id: int) -> str:
-    return user_modes.get(user_id, "FLASH")  # По умолчанию быстрый режим
+IMAGE_EDIT_MODELS = {
+    "PRO": ["gemini-3-pro-image-preview", "gemini-3.1-pro-preview"],
+    "FLASH": ["gemini-2.5-flash-image", "gemini-3-flash"]
+}
 
-def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    current_mode = get_user_mode(user_id)
-    # Показываем кнопку ДРУГОГО режима, чтобы пользователь мог на неё нажать для переключения
+TEXT_AUDIO_MODELS = {
+    "PRO": ["gemini-3.1-pro-preview"],
+    "FLASH": ["gemini-3-flash"]
+}
+
+async def get_user_mode(user_id: int) -> str:
+    if redis_client:
+        try:
+            mode_bytes = await redis_client.get(f"user_modes:{user_id}")
+            if mode_bytes:
+                return mode_bytes.decode("utf-8")
+            return "FLASH"
+        except Exception as e:
+            logging.error(f"Redis get mode error: {e}")
+    return user_modes.get(user_id, "FLASH")
+
+async def set_user_mode(user_id: int, mode: str):
+    if redis_client:
+        try:
+            await redis_client.set(f"user_modes:{user_id}", mode.encode("utf-8"))
+            return
+        except Exception as e:
+            logging.error(f"Redis set mode error: {e}")
+    user_modes[user_id] = mode
+
+async def get_user_action(user_id: int) -> str | None:
+    if redis_client:
+        try:
+            action_bytes = await redis_client.get(f"user_actions:{user_id}")
+            if action_bytes:
+                return action_bytes.decode("utf-8")
+            return None
+        except Exception as e:
+            logging.error(f"Redis get action error: {e}")
+    return user_actions.get(user_id)
+
+async def set_user_action(user_id: int, action: str):
+    if redis_client:
+        try:
+            await redis_client.set(f"user_actions:{user_id}", action.encode("utf-8"))
+            return
+        except Exception as e:
+            logging.error(f"Redis set action error: {e}")
+    user_actions[user_id] = action
+
+async def clear_user_action(user_id: int):
+    if redis_client:
+        try:
+            await redis_client.delete(f"user_actions:{user_id}")
+            return
+        except Exception as e:
+            logging.error(f"Redis clear action error: {e}")
+    user_actions.pop(user_id, None)
+
+async def get_user_edit_image(user_id: int) -> bytes | None:
+    if redis_client:
+        try:
+            return await redis_client.get(f"user_edit_images:{user_id}")
+        except Exception as e:
+            logging.error(f"Redis get image error: {e}")
+    return user_edit_images.get(user_id)
+
+async def set_user_edit_image(user_id: int, image_bytes: bytes):
+    if redis_client:
+        try:
+            await redis_client.set(f"user_edit_images:{user_id}", image_bytes, ex=3600)
+            return
+        except Exception as e:
+            logging.error(f"Redis set image error: {e}")
+    user_edit_images[user_id] = image_bytes
+
+async def clear_user_edit_image(user_id: int):
+    if redis_client:
+        try:
+            await redis_client.delete(f"user_edit_images:{user_id}")
+            return
+        except Exception as e:
+            logging.error(f"Redis clear image error: {e}")
+    user_edit_images.pop(user_id, None)
+
+async def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    current_mode = await get_user_mode(user_id)
     mode_btn = BTN_MODE_PRO if current_mode == "FLASH" else BTN_MODE_FLASH
     
     keyboard = ReplyKeyboardMarkup(
@@ -94,57 +188,67 @@ async def access_control_middleware(handler, event: Message, data: dict):
 # ==========================================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    user_actions.pop(message.from_user.id, None)
-    user_edit_images.pop(message.from_user.id, None)
+    user_id = message.from_user.id
+    await clear_user_action(user_id)
+    await clear_user_edit_image(user_id)
     text = (
         "👋 Привет! Я — бот-робот для работы с изображениями.\n\n"
         "Выберите действие на клавиатуре ниже:"
     )
-    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
+    kb = await get_main_keyboard(user_id)
+    await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_ART)
 async def cmd_art(message: Message):
-    user_actions[message.from_user.id] = "WAITING_ART"
+    user_id = message.from_user.id
+    await set_user_action(user_id, "WAITING_ART")
     text = (
         "С удовольствием! Я готов создать для вас изображение.\n\n"
         "**Что бы вы хотели увидеть на картинке?**\n\n"
         "Опишите вашу идею как можно подробнее (объекты, стиль, атмосфера, цвета). Чем детальнее запрос, тем лучше результат!"
     )
-    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
+    kb = await get_main_keyboard(user_id)
+    await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_EDIT)
 async def cmd_edit(message: Message):
-    user_actions[message.from_user.id] = "WAITING_EDIT_PHOTO"
-    await message.answer("🪄 Отправьте мне **фотографию**, которую нужно изменить.", reply_markup=get_main_keyboard(message.from_user.id))
+    user_id = message.from_user.id
+    await set_user_action(user_id, "WAITING_EDIT_PHOTO")
+    kb = await get_main_keyboard(user_id)
+    await message.answer("🪄 Отправьте мне **фотографию**, которую нужно изменить.", reply_markup=kb)
 
 @dp.message(F.text == BTN_HELP)
 async def cmd_help(message: Message):
-    user_actions.pop(message.from_user.id, None)
+    user_id = message.from_user.id
+    await clear_user_action(user_id)
     text = (
         "ℹ️ **Справка по боту**\n\n"
         "• **Сгенерировать картинку** — Нажмите кнопку, затем отправьте текстовое описание, и я нарисую изображение.\n"
         "• **Изменить фото** — Нажмите кнопку, отправьте фото, затем текст с инструкциями, и я внесу изменения.\n"
         "• **Смена режима** — Нажмите на кнопку с ракетой/алмазом, чтобы переключаться между быстрым (FLASH) и детальным (PRO) режимами."
     )
-    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
+    kb = await get_main_keyboard(user_id)
+    await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_MODE_PRO)
 async def cmd_set_pro(message: Message):
     user_id = message.from_user.id
-    user_modes[user_id] = "PRO"
-    await message.answer("💎 Режим PRO активирован! Качество улучшено.", reply_markup=get_main_keyboard(user_id))
+    await set_user_mode(user_id, "PRO")
+    kb = await get_main_keyboard(user_id)
+    await message.answer("💎 Режим PRO активирован! Качество улучшено.", reply_markup=kb)
 
 @dp.message(F.text == BTN_MODE_FLASH)
 async def cmd_set_flash(message: Message):
     user_id = message.from_user.id
-    user_modes[user_id] = "FLASH"
-    await message.answer("Принято! ⚡ FLASH-режим. Максимальная скорость. Жду задачу.", reply_markup=get_main_keyboard(user_id))
+    await set_user_mode(user_id, "FLASH")
+    kb = await get_main_keyboard(user_id)
+    await message.answer("Принято! ⚡ FLASH-режим. Максимальная скорость. Жду задачу.", reply_markup=kb)
 
 # ==========================================
 # ФУНКЦИИ ГЕНЕРАЦИИ ЧЕРЕЗ GEMINI
 # ==========================================
 async def generate_image_cascade(prompt: str, mode: str, message: Message) -> bytes | None:
-    models = MODES.get(mode, MODES["FLASH"])
+    models = IMAGE_GEN_MODELS.get(mode, IMAGE_GEN_MODELS["FLASH"])
     for model_name in models:
         try:
             response = await gemini_client.aio.models.generate_content(
@@ -160,6 +264,17 @@ async def generate_image_cascade(prompt: str, mode: str, message: Message) -> by
                                 data = getattr(inline_data, 'data', None)
                                 if data:
                                     return data
+            return None
+        except APIError as e:
+            logging.error(f"API Error с моделью рисования {model_name}: {e}")
+            if e.code == 400:
+                await message.answer("❌ Запрос отклонен политикой безопасности (ошибка 400).")
+                break
+            elif e.code == 429 or e.code >= 500:
+                continue
+            else:
+                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                break
         except Exception as e:
             logging.error(f"Ошибка с моделью рисования {model_name}: {e}")
             continue
@@ -167,59 +282,73 @@ async def generate_image_cascade(prompt: str, mode: str, message: Message) -> by
     return None
 
 async def edit_image(image_bytes: bytes, prompt: str, mode: str, message: Message) -> bytes | None:
-    try:
-        models = MODES.get(mode, MODES["FLASH"])
-        for model_name in models:
-            try:
-                contents = [
-                    genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    prompt
-                ]
-                response = await gemini_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents
-                )
-                if response.candidates:
-                    for candidate in response.candidates:
-                        if candidate.content and candidate.content.parts:
-                            for part in candidate.content.parts:
-                                inline_data = getattr(part, 'inline_data', None)
-                                if inline_data:
-                                    data = getattr(inline_data, 'data', None)
-                                    if data:
-                                        return data
-            except Exception as e:
-                logging.error(f"Ошибка с моделью изменения {model_name}: {e}")
+    models = IMAGE_EDIT_MODELS.get(mode, IMAGE_EDIT_MODELS["FLASH"])
+    for model_name in models:
+        try:
+            contents = [
+                genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                prompt
+            ]
+            response = await gemini_client.aio.models.generate_content(
+                model=model_name,
+                contents=contents
+            )
+            if response.candidates:
+                for candidate in response.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            inline_data = getattr(part, 'inline_data', None)
+                            if inline_data:
+                                data = getattr(inline_data, 'data', None)
+                                if data:
+                                    return data
+            return None
+        except APIError as e:
+            logging.error(f"API Error с моделью изменения {model_name}: {e}")
+            if e.code == 400:
+                await message.answer("❌ Запрос отклонен политикой безопасности (ошибка 400).")
+                break
+            elif e.code == 429 or e.code >= 500:
                 continue
-        await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
-        return None
-    except Exception as e:
-        logging.error(f"Глобальная ошибка при изменении изображения: {e}")
-        await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
-        return None
+            else:
+                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                break
+        except Exception as e:
+            logging.error(f"Ошибка с моделью изменения {model_name}: {e}")
+            continue
+    await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
+    return None
 
-async def transcribe_audio(audio_bytes: bytes, mode: str) -> str | None:
-    try:
-        contents = [
-            genai_types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
-            "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
-        ]
-        models = MODES.get(mode, MODES["FLASH"])
-        for model_name in models:
-            try:
-                response = await gemini_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents
-                )
-                if response.text:
-                    return response.text.strip()
-            except Exception as e:
-                logging.error(f"Ошибка с текстовой моделью {model_name}: {e}")
+async def transcribe_audio(audio_bytes: bytes, mode: str, message: Message) -> str | None:
+    contents = [
+        genai_types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
+        "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
+    ]
+    models = TEXT_AUDIO_MODELS.get(mode, TEXT_AUDIO_MODELS["FLASH"])
+    for model_name in models:
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=model_name,
+                contents=contents
+            )
+            if response.text:
+                return response.text.strip()
+            return None
+        except APIError as e:
+            logging.error(f"API Error с текстовой моделью {model_name}: {e}")
+            if e.code == 400:
+                await message.answer("❌ Голосовое сообщение отклонено политикой безопасности (ошибка 400).")
+                break
+            elif e.code == 429 or e.code >= 500:
                 continue
-        return None
-    except Exception as e:
-        logging.error(f"Глобальная ошибка при распознавании голоса: {e}")
-        return None
+            else:
+                await message.answer(f"❌ Произошла ошибка API: {e.code}")
+                break
+        except Exception as e:
+            logging.error(f"Ошибка с текстовой моделью {model_name}: {e}")
+            continue
+    await message.answer("❌ Ошибка транскрибации: сервис временно перегружен или недоступен.")
+    return None
 
 # ==========================================
 # ОБРАБОТЧИКИ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ
@@ -227,30 +356,30 @@ async def transcribe_audio(audio_bytes: bytes, mode: str) -> str | None:
 async def process_user_text_input(text: str, message: Message, bot: Bot):
     """Общая логика обработки текста или расшифрованного голоса"""
     user_id = message.from_user.id
-    action = user_actions.get(user_id)
-    mode = get_user_mode(user_id)
+    action = await get_user_action(user_id)
+    mode = await get_user_mode(user_id)
     
     if action == "WAITING_ART":
         msg = await message.answer("⏳ Рисую...")
         image_bytes = await generate_image_cascade(text, mode, message)
         if image_bytes:
             await message.answer_photo(types.BufferedInputFile(image_bytes, filename="art.jpg"))
-            user_actions.pop(user_id, None)
+            await clear_user_action(user_id)
         await msg.delete()
         
     elif action == "WAITING_EDIT_PROMPT":
-        image_bytes = user_edit_images.get(user_id)
+        image_bytes = await get_user_edit_image(user_id)
         if not image_bytes:
             await message.answer("⚠️ Ошибка: фотография не найдена. Попробуйте нажать кнопку '🪄 Изменить фото' заново.")
-            user_actions.pop(user_id, None)
+            await clear_user_action(user_id)
             return
 
         msg = await message.answer("⏳ Волшебство в процессе (изменяю картинку)...")
         edited_image_bytes = await edit_image(image_bytes, text, mode, message)
         if edited_image_bytes:
             await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
-            user_actions.pop(user_id, None)
-            user_edit_images.pop(user_id, None)
+            await clear_user_action(user_id)
+            await clear_user_edit_image(user_id)
         await msg.delete()
 
     elif action == "WAITING_EDIT_PHOTO":
@@ -268,7 +397,7 @@ async def handle_user_text(message: Message, bot: Bot):
 @dp.message(F.voice)
 async def handle_user_voice(message: Message, bot: Bot):
     user_id = message.from_user.id
-    action = user_actions.get(user_id)
+    action = await get_user_action(user_id)
 
     if action == "WAITING_EDIT_PHOTO":
         await message.answer("⚠️ Я жду от вас **фотографию**, а не голосовое сообщение. Отправьте картинку!")
@@ -286,21 +415,19 @@ async def handle_user_voice(message: Message, bot: Bot):
     downloaded_file = await bot.download_file(file_path)
     audio_bytes = downloaded_file.read()
 
-    mode = get_user_mode(user_id)
-    text = await transcribe_audio(audio_bytes, mode)
+    mode = await get_user_mode(user_id)
+    text = await transcribe_audio(audio_bytes, mode, message)
     await msg.delete()
 
     if text:
         # Отобразим пользователю, как мы поняли его голосовое, для ясности (но это опционально, можно сразу передать дальше)
         await message.answer(f"🎙 *Распознано:* {text}", parse_mode=ParseMode.MARKDOWN)
         await process_user_text_input(text, message, bot)
-    else:
-        await message.answer("❌ Извините, не удалось распознать голосовое сообщение.")
 
 @dp.message(F.photo)
 async def handle_user_photo(message: Message, bot: Bot):
     user_id = message.from_user.id
-    action = user_actions.get(user_id)
+    action = await get_user_action(user_id)
     
     if action == "WAITING_EDIT_PHOTO":
         msg = await message.answer("Загружаю фото...")
@@ -310,8 +437,8 @@ async def handle_user_photo(message: Message, bot: Bot):
         file_path = file.file_path
         downloaded_file = await bot.download_file(file_path)
         
-        user_edit_images[user_id] = downloaded_file.read()
-        user_actions[user_id] = "WAITING_EDIT_PROMPT"
+        await set_user_edit_image(user_id, downloaded_file.read())
+        await set_user_action(user_id, "WAITING_EDIT_PROMPT")
         
         await msg.delete()
         await message.answer("📸 Фото получено! Теперь отправьте текстом (или голосовым), что именно нужно на нём изменить.")
@@ -349,17 +476,25 @@ async def main():
         
         await bot.set_webhook(f"{WEBHOOK_URL}/webhook", secret_token=webhook_secret)
         
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-        await site.start()
-        
-        while True:
-            await asyncio.sleep(3600)
+        try:
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+            await site.start()
+            
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            if redis_client:
+                await redis_client.aclose()
     else:
         logging.info("Запуск локального Polling...")
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        try:
+            await dp.start_polling(bot)
+        finally:
+            if redis_client:
+                await redis_client.aclose()
 
 if __name__ == "__main__":
     try:
