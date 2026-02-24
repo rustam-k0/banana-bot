@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import sys
+import html
+import re
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -9,12 +11,16 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from google.genai.errors import APIError
-from typing import Dict
+from typing import Dict, Optional
 import redis.asyncio as redis
 
 # Загружаем переменные окружения
@@ -37,37 +43,46 @@ if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
     logging.error("Не найден TELEGRAM_BOT_TOKEN или GOOGLE_API_KEY в .env")
     sys.exit(1)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
+logging.getLogger("google.genai").setLevel(logging.WARNING)
+logging.getLogger("google.api_core").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
 gemini_client = genai.Client(api_key=GOOGLE_API_KEY, http_options={"api_version": "v1alpha"})
 
-# Настройка Redis
+# Настройка Redis и FSM Storage
 if REDIS_URL:
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=False)
-        logging.info("Redis подключен для хранения состояний.")
+        storage = RedisStorage(redis=redis_client)
+        logging.info("Redis подключен для хранения состояний FSM.")
     except Exception as e:
         logging.error(f"Ошибка при подключении к Redis: {e}")
         redis_client = None
+        storage = MemoryStorage()
+        logging.info("Используется in-memory хранилище FSM (ВНИМАНИЕ: данные сбросятся при рестарте).")
 else:
     redis_client = None
-    logging.info("REDIS_URL не найден, используется in-memory хранилище (ВНИМАНИЕ: данные сбросятся при рестарте).")
+    storage = MemoryStorage()
+    logging.info("REDIS_URL не найден, используется in-memory хранилище FSM (ВНИМАНИЕ: данные сбросятся при рестарте).")
+
+dp = Dispatcher(storage=storage)
 
 # ==========================================
 # КОНСТАНТЫ И СОСТОЯНИЯ
 # ==========================================
-BTN_ART = "🎨 Нарисовать"
-BTN_EDIT = "🪄 Изменить"
-BTN_HELP = "ℹ️ Справка"
-BTN_MODE_PRO = "💎 Качество (PRO)"
-BTN_MODE_FLASH = "🚀 Скорость (FLASH)"
+BTN_ART = "🎨 Создать шедевр"
+BTN_EDIT = "🪄 Преобразить фото"
+BTN_HELP = "💡 Подсказка"
+BTN_MODE_PRO = "💎 Детально (PRO)"
+BTN_MODE_FLASH = "⚡️ Быстро (FLASH)"
 
-# In-memory fallbacks
-user_modes: Dict[int, str] = {}
-user_actions: Dict[int, str] = {}
-user_edit_images: Dict[int, bytes] = {}
+class BotStates(StatesGroup):
+    WAITING_ART = State()
+    WAITING_EDIT_PHOTO = State()
+    WAITING_EDIT_PROMPT = State()
 
 IMAGE_GEN_MODELS = {
     "PRO": ["gemini-3-pro-image-preview"],
@@ -84,83 +99,16 @@ TEXT_AUDIO_MODELS = {
     "FLASH": ["gemini-3-flash-preview"]
 }
 
-async def get_user_mode(user_id: int) -> str:
-    if redis_client:
-        try:
-            mode_bytes = await redis_client.get(f"user_modes:{user_id}")
-            if mode_bytes:
-                return mode_bytes.decode("utf-8")
-            return "FLASH"
-        except Exception as e:
-            logging.error(f"Redis get mode error: {e}")
-    return user_modes.get(user_id, "FLASH")
+def format_html_response(text: str) -> str:
+    """Экранирует спецсимволы и конвертирует базовый Markdown (жирный, моноширинный) в HTML"""
+    text = html.escape(text, quote=False)
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    return text
 
-async def set_user_mode(user_id: int, mode: str):
-    if redis_client:
-        try:
-            await redis_client.set(f"user_modes:{user_id}", mode.encode("utf-8"))
-            return
-        except Exception as e:
-            logging.error(f"Redis set mode error: {e}")
-    user_modes[user_id] = mode
-
-async def get_user_action(user_id: int) -> str | None:
-    if redis_client:
-        try:
-            action_bytes = await redis_client.get(f"user_actions:{user_id}")
-            if action_bytes:
-                return action_bytes.decode("utf-8")
-            return None
-        except Exception as e:
-            logging.error(f"Redis get action error: {e}")
-    return user_actions.get(user_id)
-
-async def set_user_action(user_id: int, action: str):
-    if redis_client:
-        try:
-            await redis_client.set(f"user_actions:{user_id}", action.encode("utf-8"))
-            return
-        except Exception as e:
-            logging.error(f"Redis set action error: {e}")
-    user_actions[user_id] = action
-
-async def clear_user_action(user_id: int):
-    if redis_client:
-        try:
-            await redis_client.delete(f"user_actions:{user_id}")
-            return
-        except Exception as e:
-            logging.error(f"Redis clear action error: {e}")
-    user_actions.pop(user_id, None)
-
-async def get_user_edit_image(user_id: int) -> bytes | None:
-    if redis_client:
-        try:
-            return await redis_client.get(f"user_edit_images:{user_id}")
-        except Exception as e:
-            logging.error(f"Redis get image error: {e}")
-    return user_edit_images.get(user_id)
-
-async def set_user_edit_image(user_id: int, image_bytes: bytes):
-    if redis_client:
-        try:
-            await redis_client.set(f"user_edit_images:{user_id}", image_bytes, ex=3600)
-            return
-        except Exception as e:
-            logging.error(f"Redis set image error: {e}")
-    user_edit_images[user_id] = image_bytes
-
-async def clear_user_edit_image(user_id: int):
-    if redis_client:
-        try:
-            await redis_client.delete(f"user_edit_images:{user_id}")
-            return
-        except Exception as e:
-            logging.error(f"Redis clear image error: {e}")
-    user_edit_images.pop(user_id, None)
-
-async def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    current_mode = await get_user_mode(user_id)
+async def get_main_keyboard(state: FSMContext) -> ReplyKeyboardMarkup:
+    data = await state.get_data()
+    current_mode = data.get("mode", "FLASH")
     mode_btn = BTN_MODE_PRO if current_mode == "FLASH" else BTN_MODE_FLASH
     
     keyboard = ReplyKeyboardMarkup(
@@ -179,7 +127,7 @@ async def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 @dp.message.outer_middleware()
 async def access_control_middleware(handler, event: Message, data: dict):
     if ALLOWED_USERS and event.from_user.id not in ALLOWED_USERS:
-        logging.warning(f"Доступ запрещен: {event.from_user.id}")
+        logging.warning(f"Action: access_denied | UserID: {event.from_user.id} | Reason: not_in_whitelist")
         return
     return await handler(event, data)
 
@@ -187,273 +135,303 @@ async def access_control_middleware(handler, event: Message, data: dict):
 # ОБРАБОТЧИКИ КНОПОК
 # ==========================================
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    await clear_user_action(user_id)
-    await clear_user_edit_image(user_id)
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(mode="FLASH")
+    logging.info(f"Action: cmd_start | UserID: {message.from_user.id}")
+    
     text = (
-        "👋 Привет! Я — нейросеть для работы с картинками.\n\n"
-        "Выберите действие в меню ниже:"
+        "👋 Привет! Я твой дружелюбный ИИ-художник. 🎨\n\n"
+        "Давай сотворим что-нибудь невероятное! Выбери нужное действие в меню ниже: 👇"
     )
-    kb = await get_main_keyboard(user_id)
+    kb = await get_main_keyboard(state)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_ART)
-async def cmd_art(message: Message):
-    user_id = message.from_user.id
-    await set_user_action(user_id, "WAITING_ART")
+async def cmd_art(message: Message, state: FSMContext):
+    await state.set_state(BotStates.WAITING_ART)
+    logging.info(f"Action: cmd_art | UserID: {message.from_user.id}")
     text = (
-        "🎨 **Что нарисуем?**\n\n"
-        "Опишите идею детально: объекты, стиль, цвета. Чем подробнее — тем круче результат!"
+        "✨ <b>Что будем рисовать?</b>\n\n"
+        "Расскажи мне свою идею во всех красках: что должно быть на картинке, в каком стиле и цветовой гамме. Чем больше деталей, тем волшебнее будет результат! 🪄"
     )
-    kb = await get_main_keyboard(user_id)
+    kb = await get_main_keyboard(state)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_EDIT)
-async def cmd_edit(message: Message):
-    user_id = message.from_user.id
-    await set_user_action(user_id, "WAITING_EDIT_PHOTO")
-    kb = await get_main_keyboard(user_id)
-    await message.answer("🪄 Отправьте **фото**, которое нужно изменить.", reply_markup=kb)
+async def cmd_edit(message: Message, state: FSMContext):
+    await state.set_state(BotStates.WAITING_EDIT_PHOTO)
+    logging.info(f"Action: cmd_edit | UserID: {message.from_user.id}")
+    kb = await get_main_keyboard(state)
+    await message.answer("📸 Жду <b>фотографию</b>, над которой мы будем колдовать! Отправь её прямо сюда.", reply_markup=kb)
 
 @dp.message(F.text == BTN_HELP)
-async def cmd_help(message: Message):
-    user_id = message.from_user.id
-    await clear_user_action(user_id)
+async def cmd_help(message: Message, state: FSMContext):
+    await state.set_state(None)
+    logging.info(f"Action: cmd_help | UserID: {message.from_user.id}")
     text = (
-        "ℹ️ **Команды**\n\n"
-        "• **Нарисовать** — отправьте описание, и я создам картинку с нуля.\n"
-        "• **Изменить** — отправьте фото + инструкцию того, что нужно поменять.\n"
-        "• **Режимы** — переключение между скоростью (FLASH) и крутой детализацией (PRO)."
+        "💡 <b>Как со мной работать:</b>\n\n"
+        "• <b>Создать шедевр</b> — просто опиши свою задумку, и я нарисую её с нуля! 🎨\n"
+        "• <b>Преобразить фото</b> — отправь снимок и скажи, что именно добавить или убрать! 🪄\n"
+        "• <b>Режимы</b> — выбирай между молниеносной скоростью (FLASH) и невероятной детализацией (PRO)! 🌟"
     )
-    kb = await get_main_keyboard(user_id)
+    kb = await get_main_keyboard(state)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == BTN_MODE_PRO)
-async def cmd_set_pro(message: Message):
-    user_id = message.from_user.id
-    await set_user_mode(user_id, "PRO")
-    kb = await get_main_keyboard(user_id)
-    await message.answer("💎 Включен режим PRO: максимум деталей и качества.", reply_markup=kb)
+async def cmd_set_pro(message: Message, state: FSMContext):
+    await state.update_data(mode="PRO")
+    logging.info(f"Action: mode_switch | UserID: {message.from_user.id} | Mode: PRO")
+    kb = await get_main_keyboard(state)
+    await message.answer("💎 Отлично! Теперь я буду рисовать максимально детализировано и качественно (PRO). 🎨", reply_markup=kb)
 
 @dp.message(F.text == BTN_MODE_FLASH)
-async def cmd_set_flash(message: Message):
-    user_id = message.from_user.id
-    await set_user_mode(user_id, "FLASH")
-    kb = await get_main_keyboard(user_id)
-    await message.answer("🚀 Включен режим FLASH: максимальная скорость.", reply_markup=kb)
+async def cmd_set_flash(message: Message, state: FSMContext):
+    await state.update_data(mode="FLASH")
+    logging.info(f"Action: mode_switch | UserID: {message.from_user.id} | Mode: FLASH")
+    kb = await get_main_keyboard(state)
+    await message.answer("⚡️ Супер! Включаю турборежим (FLASH) — результаты будут появляться почти мгновенно! 🚀", reply_markup=kb)
 
 # ==========================================
 # ФУНКЦИИ ГЕНЕРАЦИИ ЧЕРЕЗ GEMINI
 # ==========================================
-async def generate_image_cascade(prompt: str, mode: str, message: Message) -> bytes | None:
-    models = IMAGE_GEN_MODELS.get(mode, IMAGE_GEN_MODELS["FLASH"])
-    for model_name in models:
-        try:
-            response = await gemini_client.aio.models.generate_content(
-                model=model_name,
-                contents=[prompt]
-            )
-            if response.candidates:
-                for candidate in response.candidates:
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            inline_data = getattr(part, 'inline_data', None)
-                            if inline_data:
-                                data = getattr(inline_data, 'data', None)
-                                if data:
-                                    return data
-            return None
-        except APIError as e:
-            logging.error(f"API Error с моделью рисования {model_name}: {e}")
-            if e.code == 400:
-                await message.answer("❌ Запрос отклонен фильтром безопасности.")
-                break
-            elif e.code == 429 or e.code >= 500:
-                continue
-            else:
-                await message.answer(f"❌ Ошибка сервера: {e.code}")
-                break
-        except Exception as e:
-            logging.error(f"Ошибка с моделью рисования {model_name}: {e}")
-            continue
-    await message.answer("❌ Сервис недоступен. Попробуйте позже.")
-    return None
+async def handle_genai_error(e: APIError, status_msg: Message):
+    if e.code == 400:
+        await status_msg.edit_text("🥺 Упс... Твой запрос отклонён фильтрами безопасности. Давай попробуем сформулировать иначе? 🌱")
+    elif e.code == 429:
+        await status_msg.edit_text("⏳ Ой, мы отправили слишком много запросов! Давай немного отдохнём и попробуем снова через пару минут? ☕️")
+    elif e.code >= 500:
+        await status_msg.edit_text("🔌 Серверы сейчас немного устали и временно недоступны. Пожалуйста, загляни чуточку позже! 🛠")
+    else:
+        await status_msg.edit_text(f"⚙️ Ой-ой, произошла непредвиденная ошибка ИИ: {e.message}. Попробуем ещё раз? 🔄")
 
-async def edit_image(image_bytes: bytes, prompt: str, mode: str, message: Message) -> bytes | None:
-    models = IMAGE_EDIT_MODELS.get(mode, IMAGE_EDIT_MODELS["FLASH"])
-    for model_name in models:
-        try:
-            contents = [
-                genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                prompt
-            ]
-            response = await gemini_client.aio.models.generate_content(
-                model=model_name,
-                contents=contents
-            )
-            if response.candidates:
-                for candidate in response.candidates:
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            inline_data = getattr(part, 'inline_data', None)
-                            if inline_data:
-                                data = getattr(inline_data, 'data', None)
-                                if data:
-                                    return data
-            return None
-        except APIError as e:
-            logging.error(f"API Error с моделью изменения {model_name}: {e}")
-            if e.code == 400:
-                await message.answer("❌ Запрос отклонен фильтром безопасности.")
-                break
-            elif e.code == 429 or e.code >= 500:
-                continue
-            else:
-                await message.answer(f"❌ Ошибка сервера: {e.code}")
-                break
-        except Exception as e:
-            logging.error(f"Ошибка с моделью изменения {model_name}: {e}")
-            continue
-    await message.answer("❌ Сервис недоступен. Попробуйте позже.")
-    return None
+async def generate_image_cascade(prompt: str, mode: str, status_msg: Message) -> bytes | None:
+    model_name = IMAGE_GEN_MODELS.get(mode, IMAGE_GEN_MODELS["FLASH"])[0]
+    logging.info(f"Action: api_call | Type: generate_image | Model: {model_name}")
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=model_name,
+            contents=[prompt]
+        )
+        if response.candidates:
+            for candidate in response.candidates:
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        inline_data = getattr(part, 'inline_data', None)
+                        if inline_data:
+                            data = getattr(inline_data, 'data', None)
+                            if data:
+                                return data
+        return None
+    except APIError as e:
+        logging.error(f"Action: api_error | Type: generate_image | Model: {model_name} | Error: {e.message}")
+        await handle_genai_error(e, status_msg)
+        return None
+    except Exception as e:
+        logging.error(f"Action: system_error | Type: generate_image | Model: {model_name} | Error: {e}")
+        await status_msg.edit_text("😔 К сожалению, рисование сейчас недоступно. Давай попробуем чуть позже? 🕰")
+        return None
 
-async def transcribe_audio(audio_bytes: bytes, mode: str, message: Message) -> str | None:
+async def edit_image(image_bytes: bytes, prompt: str, mode: str, status_msg: Message) -> bytes | None:
+    model_name = IMAGE_EDIT_MODELS.get(mode, IMAGE_EDIT_MODELS["FLASH"])[0]
+    logging.info(f"Action: api_call | Type: edit_image | Model: {model_name}")
+    try:
+        contents = [
+            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt
+        ]
+        response = await gemini_client.aio.models.generate_content(
+            model=model_name,
+            contents=contents
+        )
+        if response.candidates:
+            for candidate in response.candidates:
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        inline_data = getattr(part, 'inline_data', None)
+                        if inline_data:
+                            data = getattr(inline_data, 'data', None)
+                            if data:
+                                return data
+        return None
+    except APIError as e:
+        logging.error(f"Action: api_error | Type: edit_image | Model: {model_name} | Error: {e.message}")
+        await handle_genai_error(e, status_msg)
+        return None
+    except Exception as e:
+        logging.error(f"Action: system_error | Type: edit_image | Model: {model_name} | Error: {e}")
+        await status_msg.edit_text("😔 Сервис редактирования пока отдыхает. Попробуй вернуться к этому чуть позже! 🕰")
+        return None
+
+async def transcribe_audio(audio_bytes: bytes, mode: str, status_msg: Message) -> str | None:
+    model_name = TEXT_AUDIO_MODELS.get(mode, TEXT_AUDIO_MODELS["FLASH"])[0]
+    logging.info(f"Action: api_call | Type: transcribe_audio | Model: {model_name}")
     contents = [
         genai_types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
         "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
     ]
-    models = TEXT_AUDIO_MODELS.get(mode, TEXT_AUDIO_MODELS["FLASH"])
-    for model_name in models:
-        try:
-            response = await gemini_client.aio.models.generate_content(
-                model=model_name,
-                contents=contents
-            )
-            if response.text:
-                return response.text.strip()
-            return None
-        except APIError as e:
-            logging.error(f"API Error с текстовой моделью {model_name}: {e}")
-            if e.code == 400:
-                await message.answer("❌ Аудио отклонено фильтром безопасности.")
-                break
-            elif e.code == 429 or e.code >= 500:
-                continue
-            else:
-                await message.answer(f"❌ Ошибка сервера: {e.code}")
-                break
-        except Exception as e:
-            logging.error(f"Ошибка с текстовой моделью {model_name}: {e}")
-            continue
-    await message.answer("❌ Сервис транскрибации временно недоступен.")
-    return None
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=model_name,
+            contents=contents
+        )
+        if response.text:
+            return response.text.strip()
+        return None
+    except APIError as e:
+        logging.error(f"Action: api_error | Type: transcribe_audio | Model: {model_name} | Error: {e.message}")
+        await handle_genai_error(e, status_msg)
+        return None
+    except Exception as e:
+        logging.error(f"Action: system_error | Type: transcribe_audio | Model: {model_name} | Error: {e}")
+        await status_msg.edit_text("😔 Я сейчас не могу распознать голос. Давай попробуем позже или напиши текстом! ⌨️")
+        return None
 
 # ==========================================
 # ОБРАБОТЧИКИ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ
 # ==========================================
-async def process_user_text_input(text: str, message: Message, bot: Bot):
+async def process_user_text_input(text: str, message: Message, bot: Bot, state: FSMContext, status_msg: Message | None = None):
     """Общая логика обработки текста или расшифрованного голоса"""
-    user_id = message.from_user.id
-    action = await get_user_action(user_id)
-    mode = await get_user_mode(user_id)
+    current_state = await state.get_state()
+    data = await state.get_data()
+    mode = data.get("mode", "FLASH")
     
-    if action == "WAITING_ART":
-        msg = await message.answer("⏳ Рисую...")
-        image_bytes = await generate_image_cascade(text, mode, message)
+    if current_state == BotStates.WAITING_ART.state:
+        logging.info(f"Action: start_art_generation | UserID: {message.from_user.id} | Prompt: {text}")
+        if not status_msg:
+            status_msg = await message.answer("🎨 Рисую твою задумку... Немного магии! ✨")
+        else:
+            await status_msg.edit_text("🎨 Рисую твою задумку... Немного магии! ✨")
+            
+        await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
+        image_bytes = await generate_image_cascade(text, mode, status_msg)
         if image_bytes:
             await message.answer_photo(types.BufferedInputFile(image_bytes, filename="art.jpg"))
-            await clear_user_action(user_id)
-        await msg.delete()
+            await state.set_state(None)
+            await status_msg.delete()
+            logging.info(f"Action: success_art | UserID: {message.from_user.id}")
         
-    elif action == "WAITING_EDIT_PROMPT":
-        image_bytes = await get_user_edit_image(user_id)
-        if not image_bytes:
-            await message.answer("⚠️ Фото потерялось. Нажмите «🪄 Изменить» и отправьте заново.")
-            await clear_user_action(user_id)
+    elif current_state == BotStates.WAITING_EDIT_PROMPT.state:
+        edit_file_id = data.get("edit_photo_file_id")
+        if not edit_file_id:
+            msg = "🙈 Кажется, фотография потерялась... Нажми «🪄 Преобразить фото» и отправь её ещё раз! 📸"
+            if status_msg:
+                await status_msg.edit_text(msg)
+            else:
+                await message.answer(msg)
+            await state.set_state(None)
             return
 
-        msg = await message.answer("⏳ Колдую над фото...")
-        edited_image_bytes = await edit_image(image_bytes, text, mode, message)
-        if edited_image_bytes:
-            await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
-            await clear_user_action(user_id)
-            await clear_user_edit_image(user_id)
-        await msg.delete()
+        logging.info(f"Action: start_edit_generation | UserID: {message.from_user.id} | Prompt: {text}")
 
-    elif action == "WAITING_EDIT_PHOTO":
-        await message.answer("⚠️ Отправьте **фото**, а не текст.")
+        if not status_msg:
+            status_msg = await message.answer("📥 Получаю твоё фото... Почти готово! ⏳")
+        else:
+            await status_msg.edit_text("📥 Получаю твоё фото... Почти готово! ⏳")
+            
+        # Загружаем фото прямо перед отправкой в LLM (экономия памяти и ускорение FSM Storage)
+        try:
+            file = await bot.get_file(edit_file_id)
+            downloaded_file = await bot.download_file(file.file_path)
+            image_bytes = downloaded_file.read()
+            
+            await status_msg.edit_text("🪄 Колдую над деталями... Ещё чуть-чуть! ✨")
+            await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
+            edited_image_bytes = await edit_image(image_bytes, text, mode, status_msg)
+            
+            if edited_image_bytes:
+                await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
+                await state.set_state(None)
+                await state.update_data(edit_photo_file_id=None)
+                await status_msg.delete()
+                logging.info(f"Action: success_edit | UserID: {message.from_user.id}")
+        except Exception as e:
+            logging.error(f"Action: error_download_edit | UserID: {message.from_user.id} | Error: {e}")
+            await status_msg.edit_text("😢 Что-то пошло не так при обработке фото... Давай попробуем снова? 🔄")
+
+    elif current_state == BotStates.WAITING_EDIT_PHOTO.state:
+        msg = "🤗 Пожалуйста, отправь мне именно <b>фотографию</b>, а не текст!"
+        if status_msg:
+            await status_msg.edit_text(msg)
+        else:
+            await message.answer(msg)
 
     else:
-        # Если статус не задан (бот возвращает хардкод загулшку)
-        await message.answer("👆 Выберите действие в меню: нарисовать или изменить фото.")
+        msg = "👇 Пожалуйста, сначала выбери действие в меню внизу экрана! 👀"
+        if status_msg:
+            await status_msg.edit_text(msg)
+        else:
+            await message.answer(msg)
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
-async def handle_user_text(message: Message, bot: Bot):
-    await process_user_text_input(message.text, message, bot)
+async def handle_user_text(message: Message, bot: Bot, state: FSMContext):
+    await process_user_text_input(message.text, message, bot, state)
 
 @dp.message(F.voice)
-async def handle_user_voice(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    action = await get_user_action(user_id)
+async def handle_user_voice(message: Message, bot: Bot, state: FSMContext):
+    current_state = await state.get_state()
 
-    if action == "WAITING_EDIT_PHOTO":
-        await message.answer("⚠️ Отправьте **фото**, а не голосовое сообщение.")
+    if current_state == BotStates.WAITING_EDIT_PHOTO.state:
+        await message.answer("🤗 Для этого действия мне нужно <b>фото</b>, а не голосовое сообщение!")
         return
         
-    if not action:
-        await message.answer("👆 Сначала выберите действие в меню.")
+    if not current_state:
+        await message.answer("👇 Давай начнем с выбора действия в меню внизу экрана! 😊")
         return
 
-    msg = await message.answer("⏳ Слушаю...")
+    logging.info(f"Action: receive_voice | UserID: {message.from_user.id}")
+    status_msg = await message.answer("🎧 Внимательно слушаю твоё сообщение...")
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
-    file_id = message.voice.file_id
-    file = await bot.get_file(file_id)
-    file_path = file.file_path
-    downloaded_file = await bot.download_file(file_path)
-    audio_bytes = downloaded_file.read()
+    try:
+        file_id = message.voice.file_id
+        file = await bot.get_file(file_id)
+        downloaded_file = await bot.download_file(file.file_path)
+        audio_bytes = downloaded_file.read()
 
-    mode = await get_user_mode(user_id)
-    text = await transcribe_audio(audio_bytes, mode, message)
-    await msg.delete()
+        data = await state.get_data()
+        mode = data.get("mode", "FLASH")
+        
+        await status_msg.edit_text("✍️ Превращаю голос в текст...")
+        text = await transcribe_audio(audio_bytes, mode, status_msg)
 
-    if text:
-        # Отобразим пользователю, как мы поняли его голосовое, для ясности (но это опционально, можно сразу передать дальше)
-        await message.answer(f"🎙 *Текст:* {text}", parse_mode=ParseMode.MARKDOWN)
-        await process_user_text_input(text, message, bot)
+        if text:
+            # Экранируем и очищаем текст для отображения (в случае спецсимволов и тд)
+            safe_text = format_html_response(text)
+            await message.answer(f"🎙 <i>Твои слова:</i> {safe_text}")
+            await process_user_text_input(text, message, bot, state, status_msg)
+            
+    except Exception as e:
+        logging.error(f"Action: error_voice_handling | UserID: {message.from_user.id} | Error: {e}")
+        await status_msg.edit_text("😢 Не удалось загрузить аудио... Попробуй повторить, пожалуйста! 🔄")
 
 @dp.message(F.photo)
-async def handle_user_photo(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    action = await get_user_action(user_id)
+async def handle_user_photo(message: Message, bot: Bot, state: FSMContext):
+    current_state = await state.get_state()
     
-    if action == "WAITING_EDIT_PHOTO":
-        msg = await message.answer("⏳ Загружаю фото...")
-        
+    if current_state == BotStates.WAITING_EDIT_PHOTO.state:
         file_id = message.photo[-1].file_id
-        file = await bot.get_file(file_id)
-        file_path = file.file_path
-        downloaded_file = await bot.download_file(file_path)
         
-        await set_user_edit_image(user_id, downloaded_file.read())
-        await set_user_action(user_id, "WAITING_EDIT_PROMPT")
+        # Сохраняем ТОЛЬКО file_id вместо скачивания и сохранения целых байтов в FSM
+        await state.update_data(edit_photo_file_id=file_id)
+        await state.set_state(BotStates.WAITING_EDIT_PROMPT)
+        logging.info(f"Action: receive_photo_for_edit | UserID: {message.from_user.id}")
         
-        await msg.delete()
-        await message.answer("📸 Готово! Что нужно изменить? (текстом или кружочком)")
+        await message.answer("📸 Фото у меня! Что именно хочется изменить? (Напиши текстом или скажи голосом) 🎙")
         
-    elif action == "WAITING_EDIT_PROMPT":
-         await message.answer("⚠️ Фото уже у меня. Теперь напишите, что изменить.")
+    elif current_state == BotStates.WAITING_EDIT_PROMPT.state:
+         await message.answer("🤗 Фото уже у меня! Просто расскажи, что хочется на нём поменять.")
 
-    elif action == "WAITING_ART":
-        await message.answer("⚠️ Чтобы нарисовать с нуля, отправьте текст, а не фото.")
+    elif current_state == BotStates.WAITING_ART.state:
+        await message.answer("🤗 Режим рисования работает по тексту. Напиши задумку словами, а не кидай фото!")
         
     else:
-        await message.answer("👆 Нажмите «🪄 Изменить» перед отправкой фото.")
+        await message.answer("👇 Сперва нажми кнопку «🪄 Преобразить фото», а потом скидывай картинку! 📸")
 
 @dp.message()
 async def handle_other_media(message: Message):
-    await message.answer("⚠️ Понимаю только обычные фото, текст и аудио.")
+    await message.answer("🥺 Извини, но я понимаю только обычные фотографии, текст и голосовые сообщения!")
 
 
 # ==========================================
