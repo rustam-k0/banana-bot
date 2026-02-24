@@ -1,166 +1,366 @@
-"""
-bot.py — Точка входа Banana Bot.
-
-Этот файл:
-1. Создаёт бота и диспетчер (aiogram)
-2. Подключает middleware для проверки доступа
-3. Запускает бота в одном из двух режимов:
-   - WEBHOOK — для сервера (Render, Railway, Heroku)
-   - POLLING — для локальной разработки на своём компьютере
-
-Режим определяется автоматически:
-  - Если в .env указан WEBHOOK_URL → webhook
-  - Если WEBHOOK_URL пуст → polling
-"""
-
 import asyncio
 import logging
+import os
+import sys
 
-from aiogram import Bot, Dispatcher, BaseMiddleware
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+from typing import Dict
 
-from config import TELEGRAM_TOKEN, WEBHOOK_URL, PORT, ALLOWED_USERS
-from handlers import router
+# Загружаем переменные окружения
+load_dotenv()
 
-# ─────────────────────────────────────────────────────────
-# НАСТРОЙКА ЛОГИРОВАНИЯ
-# Все логи выводятся в консоль с временем и уровнем.
-# ─────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+ALLOWED_USERS_ENV = os.getenv("ALLOWED_USERS", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 8080))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("banana-bot")
+# Парсим ID разрешенных пользователей
+ALLOWED_USERS = set()
+for u in ALLOWED_USERS_ENV.split(","):
+    if u.strip().isdigit():
+        ALLOWED_USERS.add(int(u.strip()))
 
-# ─────────────────────────────────────────────────────────
-# СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА
-# parse_mode не задан — каждый handler сам указывает нужный
-# ─────────────────────────────────────────────────────────
+if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
+    logging.error("Не найден TELEGRAM_BOT_TOKEN или GOOGLE_API_KEY в .env")
+    sys.exit(1)
 
-bot = Bot(
-    token=TELEGRAM_TOKEN,
-    default=DefaultBotProperties(),  # без parse_mode — указываем в каждом ответе
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY, http_options={"api_version": "v1alpha"})
 
+# ==========================================
+# КОНСТАНТЫ И СОСТОЯНИЯ
+# ==========================================
+BTN_ART = "🎨 Сгенерировать картинку"
+BTN_EDIT = "🪄 Изменить фото"
+BTN_HELP = "ℹ️ Помощь"
+BTN_MODE_PRO = "💎 Режим: PRO (Детальный)"
+BTN_MODE_FLASH = "🚀 Режим: FLASH (Быстрый)"
 
-# ─────────────────────────────────────────────────────────
-# MIDDLEWARE — КОНТРОЛЬ ДОСТУПА
-# ─────────────────────────────────────────────────────────
+# user_id -> mode ("PRO" или "FLASH")
+user_modes: Dict[int, str] = {}
+# user_id -> action ("WAITING_ART" | "WAITING_EDIT_PHOTO" | "WAITING_EDIT_PROMPT" | None)
+user_actions: Dict[int, str] = {}
+# user_id -> bytes (Временное хранилище фото для изменения)
+user_edit_images: Dict[int, bytes] = {}
 
-class AuthMiddleware(BaseMiddleware):
-    """Пропускает только пользователей из ALLOWED_USERS."""
+MODES = {
+    "PRO": ["gemini-3-pro-image-preview", "gemini-3.1-pro-preview"],
+    "FLASH": ["gemini-2.5-flash-image", "gemini-3-flash"]
+}
 
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if not user:
-            return
+def get_user_mode(user_id: int) -> str:
+    return user_modes.get(user_id, "FLASH")  # По умолчанию быстрый режим
 
-        if user.id not in ALLOWED_USERS:
-            log.warning(f"⛔ Отказ: {user.id} @{user.username}")
-            if isinstance(event, Message):
-                try:
-                    await event.reply(
-                        f"🔒 Доступ закрыт\n\n"
-                        f"Бот только для приглашённых.\n"
-                        f"Твой ID: {user.id}\n\n"
-                        f"Отправь его администратору 🙂"
-                    )
-                except Exception:
-                    pass
-            return
-
-        return await handler(event, data)
-
-
-# Подключаем middleware и роутер с обработчиками
-dp.message.middleware(AuthMiddleware())
-dp.include_router(router)
-
-
-# ─────────────────────────────────────────────────────────
-# ЗАПУСК БОТА
-# ─────────────────────────────────────────────────────────
-
-async def on_startup(bot: Bot, **dp_kwargs):
-    """
-    Хук, вызываемый aiogram при старте приложения.
-    Регистрирует webhook-URL в Telegram.
-
-    ВАЖНО: параметр называется именно `bot` (не bot_instance),
-    потому что setup_application передаёт его как keyword-аргумент
-    с именем `bot`. Если назвать иначе — получим TypeError.
-    """
-    await bot.set_webhook(
-        f"{WEBHOOK_URL}/webhook",
-        drop_pending_updates=True,   # игнорируем старые сообщения
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    current_mode = get_user_mode(user_id)
+    # Показываем кнопку ДРУГОГО режима, чтобы пользователь мог на неё нажать для переключения
+    mode_btn = BTN_MODE_PRO if current_mode == "FLASH" else BTN_MODE_FLASH
+    
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ART), KeyboardButton(text=BTN_EDIT)],
+            [KeyboardButton(text=mode_btn)],
+            [KeyboardButton(text=BTN_HELP)]
+        ],
+        resize_keyboard=True
     )
-    log.info(f"✅ Webhook установлен: {WEBHOOK_URL}/webhook")
+    return keyboard
 
+# ==========================================
+# ДОСТУП
+# ==========================================
+@dp.message.outer_middleware()
+async def access_control_middleware(handler, event: Message, data: dict):
+    if ALLOWED_USERS and event.from_user.id not in ALLOWED_USERS:
+        logging.warning(f"Доступ запрещен: {event.from_user.id}")
+        return
+    return await handler(event, data)
 
-def main():
-    """
-    Точка входа. Выбирает режим запуска:
+# ==========================================
+# ОБРАБОТЧИКИ КНОПОК
+# ==========================================
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_actions.pop(message.from_user.id, None)
+    user_edit_images.pop(message.from_user.id, None)
+    text = (
+        "👋 Привет! Я — бот-робот для работы с изображениями.\n\n"
+        "Выберите действие на клавиатуре ниже:"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
 
-    WEBHOOK (для Render и других хостингов):
-      1. Создаёт aiohttp-приложение
-      2. Регистрирует эндпоинт /webhook для Telegram
-      3. setup_application связывает бота с приложением
-         (и передаёт `bot` в startup-хуки через kwargs)
-      4. Запускает HTTP-сервер на 0.0.0.0:PORT
+@dp.message(F.text == BTN_ART)
+async def cmd_art(message: Message):
+    user_actions[message.from_user.id] = "WAITING_ART"
+    text = (
+        "С удовольствием! Я готов создать для вас изображение.\n\n"
+        "**Что бы вы хотели увидеть на картинке?**\n\n"
+        "Опишите вашу идею как можно подробнее (объекты, стиль, атмосфера, цвета). Чем детальнее запрос, тем лучше результат!"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
 
-    POLLING (для локальной разработки):
-      1. Удаляет старый webhook (если был)
-      2. Запускает бесконечный цикл опроса Telegram API
-    """
-    if WEBHOOK_URL:
-        # ── WEBHOOK-РЕЖИМ (Render.com / Railway / Heroku) ──────
-        from aiohttp import web
-        from aiogram.webhook.aiohttp_server import (
-            SimpleRequestHandler,
-            setup_application,
-        )
+@dp.message(F.text == BTN_EDIT)
+async def cmd_edit(message: Message):
+    user_actions[message.from_user.id] = "WAITING_EDIT_PHOTO"
+    await message.answer("🪄 Отправьте мне **фотографию**, которую нужно изменить.", reply_markup=get_main_keyboard(message.from_user.id))
 
-        # Создаём веб-приложение aiohttp
-        app = web.Application()
+@dp.message(F.text == BTN_HELP)
+async def cmd_help(message: Message):
+    user_actions.pop(message.from_user.id, None)
+    text = (
+        "ℹ️ **Справка по боту**\n\n"
+        "• **Сгенерировать картинку** — Нажмите кнопку, затем отправьте текстовое описание, и я нарисую изображение.\n"
+        "• **Изменить фото** — Нажмите кнопку, отправьте фото, затем текст с инструкциями, и я внесу изменения.\n"
+        "• **Смена режима** — Нажмите на кнопку с ракетой/алмазом, чтобы переключаться между быстрым (FLASH) и детальным (PRO) режимами."
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
 
-        # Эндпоинт "/" для health-check (Render проверяет, жив ли сервис)
-        app.router.add_get("/", lambda _: web.Response(text="Banana Bot 🍌 OK"))
+@dp.message(F.text == BTN_MODE_PRO)
+async def cmd_set_pro(message: Message):
+    user_id = message.from_user.id
+    user_modes[user_id] = "PRO"
+    await message.answer("💎 Режим PRO активирован! Качество улучшено.", reply_markup=get_main_keyboard(user_id))
 
-        # Регистрируем обработчик webhook от Telegram на /webhook
-        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+@dp.message(F.text == BTN_MODE_FLASH)
+async def cmd_set_flash(message: Message):
+    user_id = message.from_user.id
+    user_modes[user_id] = "FLASH"
+    await message.answer("Принято! ⚡ FLASH-режим. Максимальная скорость. Жду задачу.", reply_markup=get_main_keyboard(user_id))
 
-        # setup_application связывает aiogram-диспетчер с aiohttp
-        # и ПЕРЕДАЁТ bot= в startup-хуки (on_startup получит его)
-        setup_application(app, dp, bot=bot)
+# ==========================================
+# ФУНКЦИИ ГЕНЕРАЦИИ ЧЕРЕЗ GEMINI
+# ==========================================
+async def generate_image_cascade(prompt: str, mode: str, message: Message) -> bytes | None:
+    models = MODES.get(mode, MODES["FLASH"])
+    for model_name in models:
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=model_name,
+                contents=[prompt]
+            )
+            if response.candidates:
+                for candidate in response.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            inline_data = getattr(part, 'inline_data', None)
+                            if inline_data:
+                                data = getattr(inline_data, 'data', None)
+                                if data:
+                                    return data
+        except Exception as e:
+            logging.error(f"Ошибка с моделью рисования {model_name}: {e}")
+            continue
+    await message.answer("❌ Ошибка генерации: сервис создания картинок временно перегружен или недоступен.")
+    return None
 
-        # Регистрируем хук для установки webhook
-        dp.startup.register(on_startup)
+async def edit_image(image_bytes: bytes, prompt: str, mode: str, message: Message) -> bytes | None:
+    try:
+        models = MODES.get(mode, MODES["FLASH"])
+        for model_name in models:
+            try:
+                contents = [
+                    genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt
+                ]
+                response = await gemini_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents
+                )
+                if response.candidates:
+                    for candidate in response.candidates:
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                inline_data = getattr(part, 'inline_data', None)
+                                if inline_data:
+                                    data = getattr(inline_data, 'data', None)
+                                    if data:
+                                        return data
+            except Exception as e:
+                logging.error(f"Ошибка с моделью изменения {model_name}: {e}")
+                continue
+        await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
+        return None
+    except Exception as e:
+        logging.error(f"Глобальная ошибка при изменении изображения: {e}")
+        await message.answer("❌ Ошибка при изменении картинки. Временно недоступно.")
+        return None
 
-        log.info(f"🚀 WEBHOOK-режим | порт {PORT}")
-        web.run_app(app, host="0.0.0.0", port=PORT)
+async def transcribe_audio(audio_bytes: bytes, mode: str) -> str | None:
+    try:
+        contents = [
+            genai_types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
+            "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
+        ]
+        models = MODES.get(mode, MODES["FLASH"])
+        for model_name in models:
+            try:
+                response = await gemini_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents
+                )
+                if response.text:
+                    return response.text.strip()
+            except Exception as e:
+                logging.error(f"Ошибка с текстовой моделью {model_name}: {e}")
+                continue
+        return None
+    except Exception as e:
+        logging.error(f"Глобальная ошибка при распознавании голоса: {e}")
+        return None
+
+# ==========================================
+# ОБРАБОТЧИКИ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ
+# ==========================================
+async def process_user_text_input(text: str, message: Message, bot: Bot):
+    """Общая логика обработки текста или расшифрованного голоса"""
+    user_id = message.from_user.id
+    action = user_actions.get(user_id)
+    mode = get_user_mode(user_id)
+    
+    if action == "WAITING_ART":
+        msg = await message.answer("⏳ Рисую...")
+        image_bytes = await generate_image_cascade(text, mode, message)
+        if image_bytes:
+            await message.answer_photo(types.BufferedInputFile(image_bytes, filename="art.jpg"))
+            user_actions.pop(user_id, None)
+        await msg.delete()
+        
+    elif action == "WAITING_EDIT_PROMPT":
+        image_bytes = user_edit_images.get(user_id)
+        if not image_bytes:
+            await message.answer("⚠️ Ошибка: фотография не найдена. Попробуйте нажать кнопку '🪄 Изменить фото' заново.")
+            user_actions.pop(user_id, None)
+            return
+
+        msg = await message.answer("⏳ Волшебство в процессе (изменяю картинку)...")
+        edited_image_bytes = await edit_image(image_bytes, text, mode, message)
+        if edited_image_bytes:
+            await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
+            user_actions.pop(user_id, None)
+            user_edit_images.pop(user_id, None)
+        await msg.delete()
+
+    elif action == "WAITING_EDIT_PHOTO":
+        await message.answer("⚠️ Я жду от вас **фотографию**, а не текст. Отправьте картинку!")
 
     else:
-        # ── POLLING-РЕЖИМ (локальная разработка) ───────────────
-        log.info("🚀 POLLING-режим (WEBHOOK_URL не задан)")
-        asyncio.run(_polling())
+        # Если статус не задан (бот возвращает хардкод загулшку)
+        await message.answer("👆 Пожалуйста, выберите действие на клавиатуре ниже (нарисовать картинку или изменить фото).")
 
 
-async def _polling():
-    """Запуск бота в режиме long polling."""
-    try:
-        # Удаляем старый webhook, если он был установлен ранее
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_user_text(message: Message, bot: Bot):
+    await process_user_text_input(message.text, message, bot)
+
+@dp.message(F.voice)
+async def handle_user_voice(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    action = user_actions.get(user_id)
+
+    if action == "WAITING_EDIT_PHOTO":
+        await message.answer("⚠️ Я жду от вас **фотографию**, а не голосовое сообщение. Отправьте картинку!")
+        return
+        
+    if not action:
+        await message.answer("👆 Сначала выберите действие на клавиатуре ниже (нарисовать картинку или изменить фото).")
+        return
+
+    msg = await message.answer("⏳ Слушаю...")
+    
+    file_id = message.voice.file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
+    downloaded_file = await bot.download_file(file_path)
+    audio_bytes = downloaded_file.read()
+
+    mode = get_user_mode(user_id)
+    text = await transcribe_audio(audio_bytes, mode)
+    await msg.delete()
+
+    if text:
+        # Отобразим пользователю, как мы поняли его голосовое, для ясности (но это опционально, можно сразу передать дальше)
+        await message.answer(f"🎙 *Распознано:* {text}", parse_mode=ParseMode.MARKDOWN)
+        await process_user_text_input(text, message, bot)
+    else:
+        await message.answer("❌ Извините, не удалось распознать голосовое сообщение.")
+
+@dp.message(F.photo)
+async def handle_user_photo(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    action = user_actions.get(user_id)
+    
+    if action == "WAITING_EDIT_PHOTO":
+        msg = await message.answer("Загружаю фото...")
+        
+        file_id = message.photo[-1].file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        downloaded_file = await bot.download_file(file_path)
+        
+        user_edit_images[user_id] = downloaded_file.read()
+        user_actions[user_id] = "WAITING_EDIT_PROMPT"
+        
+        await msg.delete()
+        await message.answer("📸 Фото получено! Теперь отправьте текстом (или голосовым), что именно нужно на нём изменить.")
+        
+    elif action == "WAITING_EDIT_PROMPT":
+         await message.answer("⚠️ Фото уже получено. Отправьте **текст**, описывающий необходимые изменения.")
+
+    elif action == "WAITING_ART":
+        await message.answer("⚠️ Для генерации новой картинки нужен **текст** (описание), а не фото. Отправьте словесное описание для Арта.")
+        
+    else:
+        await message.answer("👆 Выберите действие '🪄 Изменить фото' на клавиатуре перед отправкой фотографий.")
+
+@dp.message()
+async def handle_other_media(message: Message):
+    await message.answer("⚠️ Я работаю только с текстом, голосовыми и обычными фотографиями. Пожалуйста, используйте кнопки.")
+
+
+# ==========================================
+# ТОЧКА ВХОДА И ЗАПУСК (MAIN)
+# ==========================================
+async def main():
+    if WEBHOOK_URL:
+        logging.info(f"Запуск Webhook на порту {PORT}")
+        app = web.Application()
+        webhook_requests_handler = SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+            secret_token=TELEGRAM_BOT_TOKEN
+        )
+        webhook_requests_handler.register(app, path="/webhook")
+        setup_application(app, dp, bot=bot)
+        
+        await bot.set_webhook(f"{WEBHOOK_URL}/webhook", secret_token=TELEGRAM_BOT_TOKEN)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+        await site.start()
+        
+        while True:
+            await asyncio.sleep(3600)
+    else:
+        logging.info("Запуск локального Polling...")
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("✅ Бот запущен! Жду сообщений… (Ctrl+C для остановки)")
-        # Бесконечный цикл опроса Telegram API
         await dp.start_polling(bot)
-    finally:
-        # Закрываем HTTP-сессию при выходе
-        await bot.session.close()
-
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен.")
