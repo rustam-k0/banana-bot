@@ -70,18 +70,18 @@ user_actions: Dict[int, str] = {}
 user_edit_images: Dict[int, bytes] = {}
 
 IMAGE_GEN_MODELS = {
-    "PRO": ["gemini-3-pro-image-preview", "gemini-3.1-pro-preview"],
-    "FLASH": ["gemini-2.5-flash-image", "gemini-3-flash"]
+    "PRO": ["gemini-3-pro-image-preview"],
+    "FLASH": ["gemini-2.5-flash-image"]
 }
 
 IMAGE_EDIT_MODELS = {
-    "PRO": ["gemini-3-pro-image-preview", "gemini-3.1-pro-preview"],
-    "FLASH": ["gemini-2.5-flash-image", "gemini-3-flash"]
+    "PRO": ["gemini-3.1-pro-preview"],
+    "FLASH": ["gemini-3-flash-preview"]
 }
 
 TEXT_AUDIO_MODELS = {
     "PRO": ["gemini-3.1-pro-preview"],
-    "FLASH": ["gemini-3-flash"]
+    "FLASH": ["gemini-3-flash-preview"]
 }
 
 async def get_user_mode(user_id: int) -> str:
