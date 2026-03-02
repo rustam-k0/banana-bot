@@ -99,12 +99,12 @@ class BotStates(StatesGroup):
 # Конфигурация используемых моделей для различных задач в зависимости от выбранного режима
 IMAGE_GEN_MODELS = {
     "PRO": ["gemini-3-pro-image-preview"],
-    "FLASH": ["gemini-2.5-flash-image"]
+    "FLASH": ["gemini-3.1-flash-image-preview"]
 }
 
 IMAGE_EDIT_MODELS = {
     "PRO": ["gemini-3-pro-image-preview"],
-    "FLASH": ["gemini-2.5-flash-image"]
+    "FLASH": ["gemini-3.1-flash-image-preview"]
 }
 
 TEXT_AUDIO_MODELS = {
