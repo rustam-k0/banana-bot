@@ -23,17 +23,19 @@ from google.genai.errors import APIError
 from typing import Dict, Optional
 import redis.asyncio as redis
 
-# Очистка логеров сторонних библиотек от лишнего спама
+from texts import TEXTS
+
+# Clean up verbose third-party logger output
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
 logging.getLogger("google.genai").setLevel(logging.WARNING)
 logging.getLogger("google.api_core").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# Подгрузка переменных окружения
+# Load environment variables
 load_dotenv()
 
-# Чтение основных настроек
+# Read main configurations
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 ALLOWED_USERS_ENV = os.getenv("ALLOWED_USERS", "")
@@ -41,62 +43,53 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8080))
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Формирование множества ID пользователей, которым разрешен доступ к боту
+# Build a set of allowed user IDs for white-listing access
 ALLOWED_USERS = set()
 for u in ALLOWED_USERS_ENV.split(","):
     if u.strip().isdigit():
         ALLOWED_USERS.add(int(u.strip()))
 
 if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
-    logging.error("Не найден TELEGRAM_BOT_TOKEN или GOOGLE_API_KEY в .env")
+    logging.error("TELEGRAM_BOT_TOKEN or GOOGLE_API_KEY not found in .env")
     sys.exit(1)
 
-# Инициализация объектов Aiogram с указанием формата разметки по умолчанию
+# Initialize Aiogram instances with default HTML parsing
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# Инициализация клиента Google Gemini
+# Initialize Google Gemini Client
 gemini_client = genai.Client(api_key=GOOGLE_API_KEY, http_options={"api_version": "v1alpha"})
 
 # ==========================================
-# ИНИЦИАЛИЗАЦИЯ ХРАНИЛИЩА СОСТОЯНИЙ (FSM)
+# STATE STORAGE (FSM) INITIALIZATION
 # ==========================================
-# Если указан URL Redis, используем его для хранения состояний и данных пользователей
 if REDIS_URL:
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=False)
         storage = RedisStorage(redis=redis_client)
-        logging.info("Redis успешно подключен для хранения состояний FSM.")
+        logging.info("Redis successfully connected for FSM storage.")
     except Exception as e:
-        logging.error(f"Ошибка при подключении к Redis: {e}")
+        logging.error(f"Error connecting to Redis: {e}")
         redis_client = None
         storage = MemoryStorage()
-        logging.info("Откат: Используется in-memory хранилище FSM (Внимание: данные очищаются при перезапуске).")
+        logging.info("Fallback: Using in-memory FSM storage (Warning: Data clears on restart).")
 else:
     redis_client = None
     storage = MemoryStorage()
-    logging.info("REDIS_URL не найден, используется in-memory хранилище FSM (Внимание: данные очищаются при перезапуске).")
+    logging.info("REDIS_URL not found, using in-memory FSM storage.")
 
 dp = Dispatcher(storage=storage)
 
 
 # ==========================================
-# КОНСТАНТЫ И СОСТОЯНИЯ FSM
+# CONSTANTS & FSM STATES
 # ==========================================
-
-# Тексты кнопок главного меню
-BTN_GENERATE_IMAGE = "🎨 Сгенерировать фото"
-BTN_EDIT_IMAGE = "🪄 Изменить фото"
-BTN_HELP = "💡 Справка"
-BTN_MODE_PRO = "💎 Детально (PRO)"
-BTN_MODE_FLASH = "⚡️ Быстро (FLASH)"
-
 class BotStates(StatesGroup):
-    """Возможные шаги текущего сеанса пользователя"""
-    WAITING_FOR_IMAGE_PROMPT = State()   # Бот ждет описание фото для генерации с нуля
-    WAITING_FOR_PHOTO_TO_EDIT = State()  # Бот ждет саму фотографию для изменения
-    WAITING_FOR_EDIT_PROMPT = State()    # Бот получил фото и ждет текстовую инструкцию (что изменить)
+    WAITING_FOR_LANGUAGE = State()       # Bot expects language selection
+    WAITING_FOR_IMAGE_PROMPT = State()   # Bot expects a description for generating an image
+    WAITING_FOR_PHOTO_TO_EDIT = State()  # Bot expects a photo to edit
+    WAITING_FOR_EDIT_PROMPT = State()    # Bot received the photo and is waiting for text instructions on how to edit
 
-# Конфигурация используемых моделей для различных задач в зависимости от выбранного режима
+# Model configuration based on the selected performance mode
 IMAGE_GEN_MODELS = {
     "PRO": ["gemini-3-pro-image-preview"],
     "FLASH": ["gemini-3.1-flash-image-preview"]
@@ -112,40 +105,62 @@ TEXT_AUDIO_MODELS = {
     "FLASH": ["gemini-3-flash-preview"]
 }
 
+# Button text matching lists (used for command routing)
+BTN_GENERATE_LIST = [TEXTS["EN"]["BTN_GENERATE"], TEXTS["RU"]["BTN_GENERATE"]]
+BTN_EDIT_LIST = [TEXTS["EN"]["BTN_EDIT"], TEXTS["RU"]["BTN_EDIT"]]
+BTN_HELP_LIST = [TEXTS["EN"]["BTN_HELP"], TEXTS["RU"]["BTN_HELP"]]
+BTN_PRO_LIST = [TEXTS["EN"]["BTN_PRO"], TEXTS["RU"]["BTN_PRO"]]
+BTN_FLASH_LIST = [TEXTS["EN"]["BTN_FLASH"], TEXTS["RU"]["BTN_FLASH"]]
+BTN_LANG_LIST = [TEXTS["EN"]["BTN_LANG"], TEXTS["RU"]["BTN_LANG"]]
+
 
 # ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# UTILITY FUNCTIONS
 # ==========================================
 def format_html_response(text: str) -> str:
-    """Утилитная функция: экранирует текст пользователя и конвертирует базовый Markdown в HTML-теги для Telegram"""
+    """Utility function: Escapes user text and converts basic Markdown to Telegram HTML tags"""
     text = html.escape(text, quote=False)
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
     text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
     return text
 
 async def get_main_keyboard(state: FSMContext) -> ReplyKeyboardMarkup:
-    """Динамическое формирование главной клавиатуры. Подстраивает кнопку режима на противоположную текущему."""
+    """Dynamically build the main keyboard based on language and active mode."""
     data = await state.get_data()
+    lang = data.get("lang", "EN")
     current_mode = data.get("mode", "FLASH")
-    mode_btn = BTN_MODE_PRO if current_mode == "FLASH" else BTN_MODE_FLASH
+    
+    t = TEXTS[lang]
+    mode_btn = t["BTN_PRO"] if current_mode == "FLASH" else t["BTN_FLASH"]
     
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_GENERATE_IMAGE), KeyboardButton(text=BTN_EDIT_IMAGE)],
+            [KeyboardButton(text=t["BTN_GENERATE"]), KeyboardButton(text=t["BTN_EDIT"])],
             [KeyboardButton(text=mode_btn)],
-            [KeyboardButton(text=BTN_HELP)]
+            [KeyboardButton(text=t["BTN_LANG"]), KeyboardButton(text=t["BTN_HELP"])]
         ],
         resize_keyboard=True
     )
     return keyboard
 
+def get_lang_keyboard() -> ReplyKeyboardMarkup:
+    """Builds the language selection keyboard"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="English 🇬🇧"), KeyboardButton(text="Русский 🇷🇺")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    return keyboard
+
 
 # ==========================================
-# МИДЛВАРЫ
+# MIDDLEWARES
 # ==========================================
 @dp.message.outer_middleware()
 async def access_control_middleware(handler, event: Message, data: dict):
-    """Блокировщик доступа: отсекает сообщения от пользователей, которых нет в белом списке ALLOWED_USERS"""
+    """Access Blocker: Filters out messages from users not listed in the ALLOWED_USERS whitelist"""
     if ALLOWED_USERS and event.from_user.id not in ALLOWED_USERS:
         logging.warning(f"Action: access_denied | UserID: {event.from_user.id} | Reason: not_in_whitelist")
         return
@@ -153,91 +168,141 @@ async def access_control_middleware(handler, event: Message, data: dict):
 
 
 # ==========================================
-# ОБРАБОТЧИКИ КНОПОК И КОМАНД
+# LANGUAGE SELECTION HANDLERS
+# ==========================================
+@dp.message(F.text.in_(BTN_LANG_LIST))
+async def command_change_lang(message: Message, state: FSMContext):
+    """Triggered when the user wants to change their language"""
+    await state.set_state(BotStates.WAITING_FOR_LANGUAGE)
+    
+    data = await state.get_data()
+    lang = data.get("lang", "EN")
+    t = TEXTS[lang]
+    
+    await message.answer(t["CHOOSE_LANG"], reply_markup=get_lang_keyboard())
+
+@dp.message(BotStates.WAITING_FOR_LANGUAGE, F.text.in_(["English 🇬🇧", "Русский 🇷🇺"]))
+async def handle_language_selection(message: Message, state: FSMContext):
+    """Saves the chosen language to state and shows the main menu"""
+    lang = "EN" if "English" in message.text else "RU"
+    await state.update_data(lang=lang)
+    await state.set_state(None)
+    
+    t = TEXTS[lang]
+    kb = await get_main_keyboard(state)
+    await message.answer(t["LANG_SET"], reply_markup=kb)
+    await message.answer(t["WELCOME"], reply_markup=kb)
+
+@dp.message(BotStates.WAITING_FOR_LANGUAGE)
+async def handle_invalid_language(message: Message, state: FSMContext):
+    """Fallback if user types something invalid during language selection"""
+    await message.answer("Please choose a language from the keyboard below.\nПожалуйста, выберите язык на клавиатуре ниже.", reply_markup=get_lang_keyboard())
+
+
+# ==========================================
+# COMMAND & BUTTON HANDLERS
 # ==========================================
 @dp.message(CommandStart())
 async def command_start(message: Message, state: FSMContext):
-    """Сброс состояния FSM, установка режима FLASH по умолчанию и приветственное сообщение"""
+    """Entry point: Reset FSM, default to FLASH, and ask for language if not set"""
+    data = await state.get_data()
+    lang = data.get("lang")
+    
     await state.clear()
     await state.update_data(mode="FLASH")
     logging.info(f"Action: command_start | UserID: {message.from_user.id}")
     
-    text = (
-        "Здравствуйте! 👋 Я бот, работающий на базе моделей Google Gemini.\n\n"
-        "Выберите необходимое действие на клавиатуре ниже, чтобы создать или отредактировать изображение."
-    )
-    kb = await get_main_keyboard(state)
-    await message.answer(text, reply_markup=kb)
+    if not lang:
+        await state.set_state(BotStates.WAITING_FOR_LANGUAGE)
+        await message.answer(TEXTS["EN"]["CHOOSE_LANG"], reply_markup=get_lang_keyboard())
+    else:
+        # User already has a language, just show the welcome text
+        await state.update_data(lang=lang)
+        t = TEXTS[lang]
+        kb = await get_main_keyboard(state)
+        await message.answer(t["WELCOME"], reply_markup=kb)
 
-@dp.message(F.text == BTN_GENERATE_IMAGE)
+@dp.message(F.text.in_(BTN_GENERATE_LIST))
 async def handle_generate_image_command(message: Message, state: FSMContext):
-    """Начало процесса генерации картинки"""
+    """Initiate the image generation process"""
     await state.set_state(BotStates.WAITING_FOR_IMAGE_PROMPT)
     logging.info(f"Action: command_generate_image | UserID: {message.from_user.id}")
-    text = (
-        "✨ <b>Режим генерации активирован</b>\n\n"
-        "Пожалуйста, отправьте подробное описание (промпт) для изображения, которое вы ходите создать. Поддерживается текстовый и голосовой ввод."
-    )
+    
+    data = await state.get_data()
+    t = TEXTS[data.get("lang", "EN")]
+    
     kb = await get_main_keyboard(state)
-    await message.answer(text, reply_markup=kb)
+    await message.answer(t["GENERATE_PROMPT"], reply_markup=kb)
 
-@dp.message(F.text == BTN_EDIT_IMAGE)
+@dp.message(F.text.in_(BTN_EDIT_LIST))
 async def handle_edit_image_command(message: Message, state: FSMContext):
-    """Начало процесса редактирования фото"""
+    """Initiate the photo editing process"""
     await state.set_state(BotStates.WAITING_FOR_PHOTO_TO_EDIT)
     logging.info(f"Action: command_edit_image | UserID: {message.from_user.id}")
+    
+    data = await state.get_data()
+    t = TEXTS[data.get("lang", "EN")]
+    
     kb = await get_main_keyboard(state)
-    await message.answer("📸 Отправьте исходную <b>фотографию</b> в чат. После этого мы укажем, что именно нужно на ней изменить.", reply_markup=kb)
+    await message.answer(t["EDIT_PROMPT"], reply_markup=kb)
 
-@dp.message(F.text == BTN_HELP)
+@dp.message(F.text.in_(BTN_HELP_LIST))
 async def command_help(message: Message, state: FSMContext):
-    """Отображение краткой справочной информации по боту"""
+    """Display quick reference information about the bot"""
     await state.set_state(None)
     logging.info(f"Action: command_help | UserID: {message.from_user.id}")
-    text = (
-        "💡 <b>Краткое руководство:</b>\n\n"
-        "• <b>Сгенерировать фото</b>: Создание изображения с нуля на основе вашего описания.\n"
-        "• <b>Изменить фото</b>: Редактирование существующей фотографии по дополнительной инструкции.\n"
-        "• <b>Режимы качества (PRO/FLASH)</b>: FLASH подходит для быстрых скетчей и ответов, а PRO нужен для высококачественной проработки деталей."
-    )
+    
+    data = await state.get_data()
+    t = TEXTS[data.get("lang", "EN")]
+    
     kb = await get_main_keyboard(state)
-    await message.answer(text, reply_markup=kb)
+    await message.answer(t["HELP_TEXT"], reply_markup=kb)
 
-@dp.message(F.text == BTN_MODE_PRO)
+@dp.message(F.text.in_(BTN_PRO_LIST))
 async def command_mode_pro(message: Message, state: FSMContext):
-    """Переключение на режим PRO: тяжелые модели Gemini"""
+    """Switch to PRO Mode: Activates heavier Gemini models"""
     await state.update_data(mode="PRO")
     logging.info(f"Action: mode_switch | UserID: {message.from_user.id} | Mode: PRO")
+    
+    data = await state.get_data()
+    t = TEXTS[data.get("lang", "EN")]
+    
     kb = await get_main_keyboard(state)
-    await message.answer("💎 Включен режим PRO (Высокая детализация и качество).", reply_markup=kb)
+    await message.answer(t["PRO_ACTIVATED"], reply_markup=kb)
 
-@dp.message(F.text == BTN_MODE_FLASH)
+@dp.message(F.text.in_(BTN_FLASH_LIST))
 async def command_mode_flash(message: Message, state: FSMContext):
-    """Переключение на легковесный и быстрый режим FLASH"""
+    """Switch to FLASH Mode: Activates lightweight and rapid models"""
     await state.update_data(mode="FLASH")
     logging.info(f"Action: mode_switch | UserID: {message.from_user.id} | Mode: FLASH")
+    
+    data = await state.get_data()
+    t = TEXTS[data.get("lang", "EN")]
+    
     kb = await get_main_keyboard(state)
-    await message.answer("⚡️ Включен режим FLASH (Оптимизация и высокая скорость).", reply_markup=kb)
+    await message.answer(t["FLASH_ACTIVATED"], reply_markup=kb)
 
 
 # ==========================================
-# ЛОГИКА АПИ-ЗАПРОСОВ К GEMINI
+# GEMINI API INTERACTION
 # ==========================================
-async def handle_genai_error(e: APIError, status_msg: Message):
-    """Обработка частых API ошибок Gemini и вывд пользователю"""
+async def handle_genai_error(e: APIError, status_msg: Message, lang: str):
+    """Handles common Gemini API errors and updates the status message for the user"""
+    t = TEXTS[lang]
     if e.code == 400:
-        await status_msg.edit_text("⚠️ Ошибка: Запрос отклонён фильтрами безопасности. Попробуйте изменить формулировку.")
+        await status_msg.edit_text(t["ERR_SAFETY"])
     elif e.code == 429:
-        await status_msg.edit_text("⏳ Превышен лимит запросов. Мы отправили слишком много команд. Пожалуйста, подождите минуту.")
+        await status_msg.edit_text(t["ERR_RATELIMIT"])
     elif e.code >= 500:
-        await status_msg.edit_text("🔌 Серверы Google Gemini временно недоступны. Пожалуйста, попробуйте запрос позже.")
+        await status_msg.edit_text(t["ERR_SERVER"])
     else:
-        await status_msg.edit_text(f"⚙️ Произошла неизвестная ошибка при обращении к API: {e.message}. Попробуйте ещё раз.")
+        await status_msg.edit_text(t["ERR_UNKNOWN"].format(error=e.message))
 
-async def generate_image_from_text(prompt: str, mode: str, status_msg: Message) -> bytes | None:
-    """Герерация изображения с нуля по тексту"""
+async def generate_image_from_text(prompt: str, mode: str, status_msg: Message, lang: str) -> bytes | None:
+    """Generates an image from scratch based on a text prompt"""
     model_name = IMAGE_GEN_MODELS.get(mode, IMAGE_GEN_MODELS["FLASH"])[0]
     logging.info(f"Action: api_call | Type: generate_image | Model: {model_name}")
+    t = TEXTS[lang]
     try:
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
@@ -255,17 +320,18 @@ async def generate_image_from_text(prompt: str, mode: str, status_msg: Message) 
         return None
     except APIError as e:
         logging.error(f"Action: api_error | Type: generate_image | Model: {model_name} | Error: {e.message}")
-        await handle_genai_error(e, status_msg)
+        await handle_genai_error(e, status_msg, lang)
         return None
     except Exception as e:
         logging.error(f"Action: system_error | Type: generate_image | Model: {model_name} | Error: {e}")
-        await status_msg.edit_text("😔 Произошел внутренний сбой сервиса генерации. Попробуйте снова чуть позже.")
+        await status_msg.edit_text(t["ERR_GEN_INTERNAL"])
         return None
 
-async def edit_image_with_prompt(image_bytes: bytes, prompt: str, mode: str, status_msg: Message) -> bytes | None:
-    """Изменение уже существующего изображения в соответствии с промптом"""
+async def edit_image_with_prompt(image_bytes: bytes, prompt: str, mode: str, status_msg: Message, lang: str) -> bytes | None:
+    """Edits an existing image strictly according to the user's prompt"""
     model_name = IMAGE_EDIT_MODELS.get(mode, IMAGE_EDIT_MODELS["FLASH"])[0]
     logging.info(f"Action: api_call | Type: edit_image | Model: {model_name}")
+    t = TEXTS[lang]
     try:
         contents = [
             genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
@@ -287,20 +353,26 @@ async def edit_image_with_prompt(image_bytes: bytes, prompt: str, mode: str, sta
         return None
     except APIError as e:
         logging.error(f"Action: api_error | Type: edit_image | Model: {model_name} | Error: {e.message}")
-        await handle_genai_error(e, status_msg)
+        await handle_genai_error(e, status_msg, lang)
         return None
     except Exception as e:
         logging.error(f"Action: system_error | Type: edit_image | Model: {model_name} | Error: {e}")
-        await status_msg.edit_text("😔 Сервис редактирования недоступен. Попробуйте повторить операцию позднее.")
+        await status_msg.edit_text(t["ERR_EDIT_INTERNAL"])
         return None
 
-async def transcribe_audio(audio_bytes: bytes, mode: str, status_msg: Message) -> str | None:
-    """Конвертация голосового сообщения в текст с помощью Gemini text/audio моделей"""
+async def transcribe_audio(audio_bytes: bytes, mode: str, status_msg: Message, lang: str) -> str | None:
+    """Converts a voice message into text using Gemini text/audio models"""
     model_name = TEXT_AUDIO_MODELS.get(mode, TEXT_AUDIO_MODELS["FLASH"])[0]
     logging.info(f"Action: api_call | Type: transcribe_audio | Model: {model_name}")
+    t = TEXTS[lang]
+    
+    prompt_lang = "Transcribe this voice message to text. Only return the recognized text without any extra words."
+    if lang == "RU":
+        prompt_lang = "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
+        
     contents = [
         genai_types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
-        "Транскрибируй это голосовое сообщение в текст. Выведи только распознанный текст без лишних слов."
+        prompt_lang
     ]
     try:
         response = await gemini_client.aio.models.generate_content(
@@ -312,36 +384,38 @@ async def transcribe_audio(audio_bytes: bytes, mode: str, status_msg: Message) -
         return None
     except APIError as e:
         logging.error(f"Action: api_error | Type: transcribe_audio | Model: {model_name} | Error: {e.message}")
-        await handle_genai_error(e, status_msg)
+        await handle_genai_error(e, status_msg, lang)
         return None
     except Exception as e:
         logging.error(f"Action: system_error | Type: transcribe_audio | Model: {model_name} | Error: {e}")
-        await status_msg.edit_text("⚠️ Не удалось распознать голосовое сообщение. Пожалуйста, попробуйте написать текстом.")
+        await status_msg.edit_text(t["ERR_AUDIO_TRANS"])
         return None
 
 
 # ==========================================
-# ОБРАБОТКА ДАННЫХ ВВОДА (ТЕКСТ/ГОЛОС/ФОТО)
+# INPUT DATA PROCESSING (TEXT/VOICE/PHOTO)
 # ==========================================
 async def process_text_or_voice_prompt(text: str, message: Message, bot: Bot, state: FSMContext, status_msg: Message | None = None):
     """
-    Единая логика для обработки финального текста:
-    Принимает готовый текст (неважно, написан он клавиатурой или расшифрован из голоса) и направляет в нужную API-функцию.
+    Unified logic for processing finalized text text details:
+    Accepts ready text (whether typed or transcribed from voice) and routes it to the appropriate API function.
     """
     current_state = await state.get_state()
     data = await state.get_data()
     mode = data.get("mode", "FLASH")
+    lang = data.get("lang", "EN")
+    t = TEXTS[lang]
     
-    # Сценарий генерации фото с нуля
+    # Image Generation Flow
     if current_state == BotStates.WAITING_FOR_IMAGE_PROMPT.state:
         logging.info(f"Action: start_art_generation | UserID: {message.from_user.id} | Prompt: {text}")
         if not status_msg:
-            status_msg = await message.answer("🎨 Процесс генерации запущен, ожидайте...")
+            status_msg = await message.answer(t["PROCESS_GEN_START"])
         else:
-            await status_msg.edit_text("🎨 Процесс генерации запущен, ожидайте...")
+            await status_msg.edit_text(t["PROCESS_GEN_START"])
             
         await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
-        image_bytes = await generate_image_from_text(text, mode, status_msg)
+        image_bytes = await generate_image_from_text(text, mode, status_msg, lang)
         
         if image_bytes:
             await message.answer_photo(types.BufferedInputFile(image_bytes, filename="art.jpg"))
@@ -349,11 +423,11 @@ async def process_text_or_voice_prompt(text: str, message: Message, bot: Bot, st
             await status_msg.delete()
             logging.info(f"Action: success_art | UserID: {message.from_user.id}")
         
-    # Сценарий редактирования существующего фото
+    # Image Editing Flow
     elif current_state == BotStates.WAITING_FOR_EDIT_PROMPT.state:
         edit_file_id = data.get("edit_photo_file_id")
         if not edit_file_id:
-            msg = "⚠️ Возникла проблема с загрузкой вашей фотографии. Выберите «🪄 Изменить фото» в меню и попробуйте отправить еще раз."
+            msg = t["ERR_LOAD_EDIT"]
             if status_msg:
                 await status_msg.edit_text(msg)
             else:
@@ -364,20 +438,20 @@ async def process_text_or_voice_prompt(text: str, message: Message, bot: Bot, st
         logging.info(f"Action: start_edit_generation | UserID: {message.from_user.id} | Prompt: {text}")
 
         if not status_msg:
-            status_msg = await message.answer("📥 Готовим вашу фотографию к преобразованиям...")
+            status_msg = await message.answer(t["PROCESS_EDIT_PREP"])
         else:
-            await status_msg.edit_text("📥 Готовим вашу фотографию к преобразованиям...")
+            await status_msg.edit_text(t["PROCESS_EDIT_PREP"])
             
-        # Загружаем фото прямо перед отправкой в ИИ для экономии памяти
+        # Download the photo just in time right before API request to save memory footprint
         try:
             file = await bot.get_file(edit_file_id)
             downloaded_file = await bot.download_file(file.file_path)
             image_bytes = downloaded_file.read()
             
-            await status_msg.edit_text("🪄 Генерируем изменения... Пожалуйста, подождите результат.")
+            await status_msg.edit_text(t["PROCESS_EDIT_GEN"])
             await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
             
-            edited_image_bytes = await edit_image_with_prompt(image_bytes, text, mode, status_msg)
+            edited_image_bytes = await edit_image_with_prompt(image_bytes, text, mode, status_msg, lang)
             
             if edited_image_bytes:
                 await message.answer_photo(types.BufferedInputFile(edited_image_bytes, filename="edited.jpg"))
@@ -387,19 +461,19 @@ async def process_text_or_voice_prompt(text: str, message: Message, bot: Bot, st
                 logging.info(f"Action: success_edit | UserID: {message.from_user.id}")
         except Exception as e:
             logging.error(f"Action: error_download_edit | UserID: {message.from_user.id} | Error: {e}")
-            await status_msg.edit_text("😢 Ошибка при загрузке и обработке фотографии из Telegram. Пожалуйста, попробуйте повторить операцию.")
+            await status_msg.edit_text(t["ERR_DL_TELEGRAM"])
 
-    # Если пользователь написал текст, но ожидалось фото
+    # Prevent submitting text when the bot expects a photo upload
     elif current_state == BotStates.WAITING_FOR_PHOTO_TO_EDIT.state:
-        msg = "Пожалуйста, отправьте именно <b>фотографию</b> (изображение)."
+        msg = t["ERR_NEED_PHOTO_NOT_TEXT"]
         if status_msg:
             await status_msg.edit_text(msg)
         else:
             await message.answer(msg)
 
-    # Состояние не задано — просим выбрать действие в меню
+    # General fallback for text
     else:
-        msg = "Пожалуйста, сначала выберите нужное действие в меню бота (создать или изменить)."
+        msg = t["ERR_MENU_FIRST"]
         if status_msg:
             await status_msg.edit_text(msg)
         else:
@@ -408,26 +482,29 @@ async def process_text_or_voice_prompt(text: str, message: Message, bot: Bot, st
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_user_text(message: Message, bot: Bot, state: FSMContext):
-    """Делегирование обработки обычного текста напрямую в универсальную функцию"""
+    """Route regular text directly to the unified processing function"""
     await process_text_or_voice_prompt(message.text, message, bot, state)
 
 @dp.message(F.voice)
 async def handle_user_voice(message: Message, bot: Bot, state: FSMContext):
-    """Обработка голосовых сообщений: скачивание, транскрибация и делегирование в универсальную функцию"""
+    """Voice handler: downloads voice, transcribes it, and routes to unified logic"""
     current_state = await state.get_state()
+    data = await state.get_data()
+    lang = data.get("lang", "EN")
+    t = TEXTS[lang]
 
-    # Если бот ждал фото
+    # Prevent trying to describe a photo using voice when waiting for photo upload
     if current_state == BotStates.WAITING_FOR_PHOTO_TO_EDIT.state:
-        await message.answer("В рамках текущего действия ожидается <b>фотография</b>, а не голосовое сообщение.")
+        await message.answer(t["VOICE_NO_PHOTO"])
         return
         
-    # Если бот ожидает команды
+    # Prevent voice interactions when idle
     if not current_state:
-        await message.answer("Пожалуйста, сначала выберите нужное действие в меню бота (создать или изменить).")
+        await message.answer(t["ERR_MENU_FIRST"])
         return
 
     logging.info(f"Action: receive_voice | UserID: {message.from_user.id}")
-    status_msg = await message.answer("🎧 Принимаю ваше аудиосообщение...")
+    status_msg = await message.answer(t["PROCESS_VOICE_RX"])
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
@@ -436,65 +513,70 @@ async def handle_user_voice(message: Message, bot: Bot, state: FSMContext):
         downloaded_file = await bot.download_file(file.file_path)
         audio_bytes = downloaded_file.read()
 
-        data = await state.get_data()
         mode = data.get("mode", "FLASH")
         
-        await status_msg.edit_text("✍️ Перевожу голос в текст...")
-        text = await transcribe_audio(audio_bytes, mode, status_msg)
+        await status_msg.edit_text(t["PROCESS_VOICE_TRANS"])
+        text = await transcribe_audio(audio_bytes, mode, status_msg, lang)
 
         if text:
-            # Экранирование спецсимволов и вывод транскрибации для проверки
+            # Display safely encoded transcription copy for validation
             safe_text = format_html_response(text)
-            await message.answer(f"🎙 <i>Распознанный текст:</i> {safe_text}")
+            await message.answer(t["TXT_TRANSCRIBED"].format(text=safe_text))
             await process_text_or_voice_prompt(text, message, bot, state, status_msg)
             
     except Exception as e:
         logging.error(f"Action: error_voice_handling | UserID: {message.from_user.id} | Error: {e}")
-        await status_msg.edit_text("⚠️ Ошибка: не удалось загрузить аудиосообщение. Попробуйте записать и отправить повторно.")
+        await status_msg.edit_text(t["ERR_VOICE_DL"])
 
 @dp.message(F.photo)
 async def handle_user_photo(message: Message, bot: Bot, state: FSMContext):
-    """Обработка загруженных пользователем фотографий"""
+    """Processes newly uploaded photos"""
     current_state = await state.get_state()
+    data = await state.get_data()
+    lang = data.get("lang", "EN")
+    t = TEXTS[lang]
     
-    # Если бот конкретно ждал фото для редактирования
+    # State matches the Edit photo intention
     if current_state == BotStates.WAITING_FOR_PHOTO_TO_EDIT.state:
         file_id = message.photo[-1].file_id
         
-        # Сохраняем только file_id в хранилище состояний Redis (или In-Memory) для экономии места
+        # We only save file_id within Redis/In-Memory contexts to prevent state overflow
         await state.update_data(edit_photo_file_id=file_id)
         await state.set_state(BotStates.WAITING_FOR_EDIT_PROMPT)
         logging.info(f"Action: receive_photo_for_edit | UserID: {message.from_user.id}")
         
-        await message.answer("📸 Фотография загружена. Напишите или отправьте голосом инструкцию: что нужно изменить на снимке?")
+        await message.answer(t["PHOTO_LOADED_PROMPT"])
         
-    # Если пользователь отправляет фото, когда его уже просили написать инструкцию
+    # Guard if the user uploads ANOTHER photo inside the prompt state
     elif current_state == BotStates.WAITING_FOR_EDIT_PROMPT.state:
-         await message.answer("Фотография уже получена! Теперь просто отправьте текстовое или голосовое описание того, что нужно изменить.")
+         await message.answer(t["PHOTO_ALREADY_RX"])
 
-    # Если пользователь отправил фото в меню генерации с нуля (где нужен промпт)
+    # Error guard: Generative workflow only supports prompts
     elif current_state == BotStates.WAITING_FOR_IMAGE_PROMPT.state:
-        await message.answer("Данный режим работы поддерживает только текстовые запросы для создания изображений. Если вы хотите изменить фото, выберите «🪄 Изменить фото» в меню.")
+        await message.answer(t["ERR_PHOTO_IN_GEN"])
         
-    # Если действие в меню не было выбрано
+    # Standard fallback
     else:
-        await message.answer("Сначала выберите кнопку «🪄 Изменить фото» в меню бота, затем отправляйте изображение.")
+        await message.answer(t["ERR_PHOTO_NO_MENU"])
 
 @dp.message()
-async def handle_other_media(message: Message):
-    """Заглушка для неподдерживаемого контента: видео, файлов, стикеров и т.д."""
-    await message.answer("Извините, на данный момент я поддерживаю только текстовые описания, голосовые сообщения и обычные фотографии. Формат файлов, видео или стикеров не поддерживается.")
+async def handle_other_media(message: Message, state: FSMContext):
+    """Fallback handler for unsupported documents: files, stickers, videos"""
+    data = await state.get_data()
+    lang = data.get("lang", "EN")
+    t = TEXTS[lang]
+    await message.answer(t["ERR_UNSUPPORTED_MEDIA"])
 
 
 # ==========================================
-# ТОЧКА ВХОДА И ЗАПУСК ПРИЛОЖЕНИЯ
+# ENTRYPOINT AND BOOTSTRAPPING
 # ==========================================
 async def main():
-    """Главная функция для конфигурации и запуска aiogram бота в режимах webhook/polling"""
+    """Main function bootstraps aiogram configuring Webhooks or Long Polling"""
     if WEBHOOK_URL:
-        logging.info(f"Запуск бота через Webhook на порту {PORT}")
+        logging.info(f"Starting bot through Webhook on port {PORT}")
         app = web.Application()
-        # Для secret_token телеграм допускает только символы A-Z, a-z, 0-9, _ и -
+        # Secret tokens for Telegram verification tolerate strictly A-Z, a-z, 0-9, _, and -
         webhook_secret = TELEGRAM_BOT_TOKEN.replace(":", "")
         webhook_requests_handler = SimpleRequestHandler(
             dispatcher=dp,
@@ -512,15 +594,15 @@ async def main():
             site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
             await site.start()
             
-            # Поддерживаем процесс запущенным
+            # Application main loop
             while True:
                 await asyncio.sleep(3600)
         finally:
             if redis_client:
                 await redis_client.aclose()
     else:
-        logging.info("Инициализация локального Polling...")
-        await bot.delete_webhook(drop_pending_updates=True) # Сброс старых webhook-настроек, если они есть
+        logging.info("Initializing local long polling...")
+        await bot.delete_webhook(drop_pending_updates=True) # Cleans up stalled webhook bindings safely
         try:
             await dp.start_polling(bot)
         finally:
@@ -531,4 +613,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Работа бота завершена администратором.")
+        logging.info("Bot successfully stopped by administrator.")

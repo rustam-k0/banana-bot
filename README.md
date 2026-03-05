@@ -1,120 +1,122 @@
-# 🍌 Banana Bot — Telegram-бот для Google Gemini
+# 🍌 Banana Bot — Telegram Bot for Google Gemini
 
-Дружелюбный, быстрый и безопасный Telegram-бот для взаимодействия с мощными генеративными моделями **Google Gemini**.
+A friendly, fast, and secure Telegram bot for interacting with powerful **Google Gemini** generative models.
 
-💡 **Главные особенности:**
-- **Stateless-архитектура:** Бот не сохраняет контекст переписки в памяти, что значительно ускоряет работу и экономит лимиты API.
-- **Понятный интерфейс:** Интуитивные кнопки и нейтральные, понятные текстовые подсказки делают использование бота комфортным для всех пользователей.
-- **Интеллектуальная обработка:** Бот принимает строго нужный формат данных (текст, фото, аудио) и корректно сообщает о внутренних ошибках или опечатках ввода.
-- **Защита от сбоев:** Предусмотрена обработка ошибок со стороны API (например, фильтры безопасности) и возможность в любой момент перезапустить или отменить процесс.
-- **Простой доступ к ИИ:** Бот позволяет пользоваться возможностями Google Gemini прямо из мессенджера Telegram без VPN и сложных конфигураций интерфейса.
+💡 **Key Features:**
+- **Bilingual Support (English & Russian):** Native localization makes the bot accessible globally. Users can choose their language during the first launch and switch at any time. All texts are securely managed through a dedicated `texts.py` dictionary.
+- **Stateless Architecture:** The bot does not keep chat context in memory, which significantly speeds up processing and saves API limits.
+- **Clear Interface:** Intuitive buttons and neutral, straightforward text prompts make using the bot comfortable for users of any skill level.
+- **Smart Processing:** The bot only accepts the necessary data formats (text, photo, audio) and cleanly reports internal errors or bad input.
+- **Crash Protection:** Handled API errors (e.g., security constraints/rate limits), allowing you to restart or cancel operations cleanly at any time.
+- **Easy Access to AI:** Harness Google Gemini's capabilities directly from Telegram without VPNs or complex interface configurations.
 
 ---
 
-## 🛠 Возможности
+## 🛠 Capabilities
 
-| Действие / Кнопка | Описание |
+| Action / Button | Description |
 |-------------------|-----------------|
-| 🎨 **Сгенерировать фото** | Создает уникальное изображение с нуля по вашему текстовому или голосовому описанию. |
-| 🪄 **Изменить фото** | Редактирует отправленную вами фотографию в соответствии с вашей инструкцией (текстом или голосом). |
-| 💡 **Справка** | Выводит краткую справку по функционалу бота. |
-| ⚡️ / 💎 **Режимы** | Позволяет переключаться между максимальным качеством и максимальной скоростью обработки. |
+| 🎨 **Generate Art** | Creates a unique image from scratch based on your text or speech. |
+| 🪄 **Edit Photo** | Modifies a photo you provided according to any text or voice instruction. |
+| 🌐 **Language / Язык** | Change the interface language between English (🇬🇧) and Russian (🇷🇺). |
+| 💡 **Help** | Displays a brief reference guide to the bot's features. |
+| ⚡️ / 💎 **Modes** | Switch seamlessly between maximum imaging detail (PRO) and maximum processing speed (FLASH). |
 
 ---
 
-## 🧠 Доступные режимы (Модели нейросети)
+## 🧠 Available AI Models (Performance Modes)
 
-У пользователя есть выбор между двумя режимами в зависимости от задач:
+Depending on the task, you can freely switch between two built-in configurations:
 
-| Режим | Описание | Используемые модели |
+| Mode | Description | Background Logic Models |
 |-------|---------|-------------------|
-| 💎 **PRO** | Детальный режим. Предлагает лучшую детализацию картинок и максимальный интеллект при обработке сложных аудио- и текстовых инструкций. | `gemini-3-pro-image-preview` (Генерация/Редактирование фото)<br>`gemini-3-flash-preview` (Распознавание аудио/Текст) |
-| ⚡️ **FLASH** | Турборежим. Генерация и ответы происходят почти мгновенно, идеально подходит для быстрых скетчей и легких правок. | `gemini-3.1-flash-image-preview` (Генерация/Редактирование фото)<br>`gemini-3-flash-preview` (Распознавание аудио/Текст) |
+| 💎 **PRO** | High detail mode. It offers much higher picture resolution and better instructions alignment. Best suited for complex demands. | `gemini-3-pro-image-preview` (Draw & Edit)<br>`gemini-3-flash-preview` (Speech & Text Parsing) |
+| ⚡️ **FLASH** | The turbo mode. Generation runs almost instantaneously, performing best for minor adjustments or simple sketch concepts. | `gemini-3.1-flash-image-preview` (Draw & Edit) <br>`gemini-3-flash-preview` (Speech & Text Parsing) |
 
 ---
 
-## ⚙️ Стек технологий
+## ⚙️ Tech Stack
 
-Проект использует современные и асинхронные инструменты:
-- **[Aiogram 3.x](https://docs.aiogram.dev/)**: Фреймворк для асинхронного создания Telegram-ботов.
-- **[Google GenAI SDK](https://github.com/google/genai-python)**: Официальная библиотека Google для работы с новейшим API моделей серии Gemini.
-- **Asyncio / Aiohttp**: Для поддержания асинхронных потоков работы и возможности деплоя через Webhook.
-- **Redis (Опционально)**: Для надежного хранения состояний пользователей (FSM) при перезапусках бота. При отсутствии `REDIS_URL` используется встроенное in-memory хранилище.
+This project is built atop modern and fully asynchronous tools:
+- **[Aiogram 3.x](https://docs.aiogram.dev/)**: Flexible framework for asynchronous Telegram bots.
+- **[Google GenAI SDK](https://github.com/google/genai-python)**: The official Google library abstracting new Gemini API standards.
+- **Asyncio / Aiohttp**: Supports pure async streams making the codebase entirely non-blocking and webhook-ready.
+- **Redis (Optional)**: Preserves state safely (FSM) over reboots. An in-memory cache acts as fallback when `REDIS_URL` isn't provided.
+- **texts.py**: A clean dictionary-based localization system to abstract all user-facing strings out of the main logic block.
 
 ---
 
-## 🚀 Инструкция по установке и запуску
+## 🚀 Setup & Installation Guide
 
-Склонируйте репозиторий и перейдите в его директорию:
+Clone the repository and go to its root directory:
 ```bash
-git clone <url_вашего_репозитория>
+git clone <your_repo_url>
 cd banana-bot
 ```
 
-### 1. Подготовка виртуального окружения
+### 1. Set Up A Virtual Environment
 
-Настоятельно рекомендуется использовать виртуальное окружение для изоляции зависимостей.
+Using an isolated environment for dependencies is highly advised.
 
-**Для macOS / Linux:**
+**On macOS / Linux:**
 ```bash
-# Создание окружения
+# Create the environment
 python3 -m venv venv
 
-# Активация окружения
+# Activate it
 source venv/bin/activate
 ```
-*Для деактивации окружения в будущем введите команду `deactivate`.*
+*(Use the `deactivate` command if you ever wish to exit.)*
 
-**Для Windows:**
+**On Windows:**
 ```cmd
-# Создание окружения
+# Create the environment
 python -m venv venv
 
-# Активация окружения (Command Prompt)
+# Activation (Command Prompt)
 venv\Scripts\activate.bat
 
-# Активация окружения (PowerShell)
+# Activation (PowerShell)
 .\venv\Scripts\Activate.ps1
 ```
-*Для деактивации окружения в будущем введите команду `deactivate`.*
 
-### 2. Установка зависимостей
+### 2. Install Package Dependencies
 
-Убедитесь, что окружение активировано, и установите библиотеки из `requirements.txt`:
+Make sure the environment remains open and activated, then securely grab dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Заполнение конфигурации
+### 3. Initialize Variables
 
-Создайте файл `.env` в корневой папке проекта и заполните его по аналогии с нижеуказанным списком:
+Create a distinct `.env` file right beside your `bot.py` script mirroring the details below:
 ```env
-TELEGRAM_BOT_TOKEN=ваш_токен_от_@BotFather
-GOOGLE_API_KEY=ваш_ключ_из_Google_AI_Studio
+TELEGRAM_BOT_TOKEN=your_token_from_@BotFather
+GOOGLE_API_KEY=your_key_from_Google_AI_Studio
 ALLOWED_USERS=123456789,987654321
 
-# Опционально: Для деплоя на серверах (Render, Heroku, Railway)
-WEBHOOK_URL=https://ваш-домен.com
+# Webhook Deployments Only (Render, Heroku, VPS)
+WEBHOOK_URL=https://your-domain.com
 PORT=8080
 
-# Опционально: Для хранения FSM (шагов пользователя) в Redis
+# For FSM Persistency
 REDIS_URL=redis://localhost:6379/0
 ```
 
-### 4. Запуск бота
+### 4. Running the Bot
 
-Убедитесь, что виртуальное окружение активировано, и запустите проект:
+If your environment is engaged correctly:
 ```bash
 python bot.py
 ```
 
-> **Примечание по архитектуре:** Бот автоматически использует метод *Long Polling*, если запускается локально без указания `WEBHOOK_URL`. Если же `WEBHOOK_URL` определен в файле `.env`, то бот автоматически поднимает aiohttp-сервер на указанном порту для работы через *Webhook*, что оптимально для Prod-окружений.
+> **Design Note:** The script defaults to pure *Long Polling* while run locally without a defined `WEBHOOK_URL`. If a `WEBHOOK_URL` enters `.env`, the script gracefully alters runtime logic pulling an aiohttp Webhook server automatically listening on the specified port.
 
-### 5. Очистка (Удаление)
+### 5. Cleaning up (Uninstallation)
 
-Если вы хотите полностью очистить проект:
-- Удалите папку виртуального окружения (`rm -rf venv` на Linux/Mac или `rmdir /s /q venv` на Windows).
-- (Опционально) удалите директорию со скриптами, если проект вам больше не нужен.
+Should you want to discard the project structure entirely:
+- Simply delete your virtual environment folder (`rm -rf venv` on Linux/Mac, or `rmdir /s /q venv` on Windows).
+- Delete the folder housing the files.
 
 ---
-*Сохраняйте безопасность: никогда не коммитьте файл `.env` с вашими реальными ключами и токенами в публичные репозитории. Для этого в проекте предусмотрен `.gitignore`.*
+*Remain Secure: Never commit `.env` containing your real keys into source version control systems (e.g. GitHub/Gitlab). A helpful `.gitignore` is provided within the repository specifically for ensuring safety.*
