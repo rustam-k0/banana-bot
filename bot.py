@@ -20,9 +20,14 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from google.genai.errors import APIError
-from typing import Dict, Optional
 import redis.asyncio as redis
 
+from config import (
+    IMAGE_EDIT_MODELS,
+    IMAGE_GEN_MODELS,
+    TEXT_AUDIO_MODELS,
+    load_config,
+)
 from texts import TEXTS
 
 # Clean up verbose third-party logger output
@@ -36,12 +41,13 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 load_dotenv()
 
 # Read main configurations
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-ALLOWED_USERS_ENV = os.getenv("ALLOWED_USERS", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8080))
-REDIS_URL = os.getenv("REDIS_URL")
+config = load_config()
+TELEGRAM_BOT_TOKEN = config.telegram_bot_token
+GOOGLE_API_KEY = config.google_api_key
+ALLOWED_USERS_ENV = config.allowed_users_env
+WEBHOOK_URL = config.webhook_url
+PORT = config.port
+REDIS_URL = config.redis_url
 
 # Build a set of allowed user IDs for white-listing access
 ALLOWED_USERS = set()
@@ -88,22 +94,6 @@ class BotStates(StatesGroup):
     WAITING_FOR_IMAGE_PROMPT = State()   # Bot expects a description for generating an image
     WAITING_FOR_PHOTO_TO_EDIT = State()  # Bot expects a photo to edit
     WAITING_FOR_EDIT_PROMPT = State()    # Bot received the photo and is waiting for text instructions on how to edit
-
-# Model configuration based on the selected performance mode
-IMAGE_GEN_MODELS = {
-    "PRO": ["gemini-3-pro-image-preview"],
-    "FLASH": ["gemini-3.1-flash-image-preview"]
-}
-
-IMAGE_EDIT_MODELS = {
-    "PRO": ["gemini-3-pro-image-preview"],
-    "FLASH": ["gemini-3.1-flash-image-preview"]
-}
-
-TEXT_AUDIO_MODELS = {
-    "PRO": ["gemini-3-flash-preview"],
-    "FLASH": ["gemini-3-flash-preview"]
-}
 
 # Button text matching lists (used for command routing)
 BTN_GENERATE_LIST = [TEXTS["EN"]["BTN_GENERATE"], TEXTS["RU"]["BTN_GENERATE"]]
