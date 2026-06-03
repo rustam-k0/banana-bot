@@ -52,14 +52,17 @@ Google. Aporto gives you **one API key for many AI models** (image, video,
 audio, search, and more) and applies **discounted routed pricing on eligible
 models, up to 60% off** compared to going direct.
 
+New accounts on Aporto receive **up to $3 in free credit** to try it out — no
+credit card required for the trial.
+
 To opt in:
 
-1. Sign up at <https://aporto.tech> (free, takes a minute).
+1. Sign up at <https://aporto.tech> (free, takes a minute — you'll get the
+   starter credit automatically).
 2. Grab an API key from <https://app.aporto.tech/settings>.
 3. Add it to your `.env`:
    ```env
-   APORTO_API_KEY=your_a...n
-   ```
+   APORTO_API_KEY=***   ```
 4. (Optional) Remove or leave your `GOOGLE_API_KEY` — Aporto takes over
    automatically when `APORTO_API_KEY` is set. If both are set, Aporto wins.
 
@@ -136,11 +139,11 @@ pip install -r requirements.txt
 Create a `.env` file next to `bot.py`:
 
 ```env
-TELEGRAM_BOT_TOKEN=*** key from @BotFather
-GOOGLE_API_KEY=*** from Google AI Studio (default AI provider)
-
-# Optional: route all AI calls through Aporto instead. See "Save with Aporto" above.
-# APORTO_API_KEY=*** from https://app.aporto.tech/settings
+TELEGRAM_BOT_TOKEN=*** AI key (preferred for Aporto's $3 trial credit). Get one at
+# https://app.aporto.tech/settings. Routes all AI calls through Aporto.
+APORTO_API_KEY=*** AI provider (fallback): Google Gemini. Required if
+# APORTO_API_KEY is not set.
+# GOOGLE_API_KEY=*** list of Telegram user IDs
 ALLOWED_USERS=123456789,987654321
 
 # Optional: webhook mode
