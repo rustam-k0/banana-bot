@@ -44,6 +44,7 @@ load_dotenv()
 config = load_config()
 TELEGRAM_BOT_TOKEN = config.telegram_bot_token
 GOOGLE_API_KEY = config.google_api_key
+APORTO_API_KEY = config.aporto_api_key
 ALLOWED_USERS_ENV = config.allowed_users_env
 WEBHOOK_URL = config.webhook_url
 PORT = config.port
@@ -55,9 +56,42 @@ for u in ALLOWED_USERS_ENV.split(","):
     if u.strip().isdigit():
         ALLOWED_USERS.add(int(u.strip()))
 
-if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEY:
-    logging.error("TELEGRAM_BOT_TOKEN or GOOGLE_API_KEY not found in .env")
+if not TELEGRAM_BOT_TOKEN:
+    logging.error("TELEGRAM_BOT_TOKEN not found in .env")
     sys.exit(1)
+
+# At least one AI provider key is required. If APORTO_API_KEY is set, the
+# three AI call-sites below are rerouted through Aporto (see
+# `aporto_client.py`). Otherwise Google Gemini is used as before.
+if not GOOGLE_API_KEY and not APORTO_API_KEY:
+    logging.error("Either GOOGLE_API_KEY or APORTO_API_KEY must be set in .env")
+    sys.exit(1)
+
+# Optional: route all AI calls through Aporto when APORTO_API_KEY is set.
+# When unset, the original Google Gemini functions defined later in this
+# file are used as-is. This is a runtime-only decision based on env, with
+# no changes to handlers, FSM, or the rest of the bot.
+if APORTO_API_KEY:
+    try:
+        from aporto_client import (
+            generate_image_from_text as _aporto_generate_image_from_text,
+            edit_image_with_prompt as _aporto_edit_image_with_prompt,
+            transcribe_audio as _aporto_transcribe_audio,
+        )
+        generate_image_from_text = _aporto_generate_image_from_text
+        edit_image_with_prompt = _aporto_edit_image_with_prompt
+        transcribe_audio = _aporto_transcribe_audio
+        logging.info(
+            "Aporto integration enabled (APORTO_API_KEY is set). "
+            "AI calls will be routed through https://aporto.tech."
+        )
+    except Exception as e:
+        logging.error(f"APORTO_API_KEY is set but aporto_client failed to load: {e}")
+        if not GOOGLE_API_KEY:
+            raise
+        logging.warning("Falling back to Google Gemini for AI calls.")
+else:
+    logging.info("APORTO_API_KEY is not set; using Google Gemini for AI calls.")
 
 # Initialize Aiogram instances with default HTML parsing
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
