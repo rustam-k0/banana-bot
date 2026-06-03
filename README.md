@@ -37,20 +37,82 @@ This repository currently implements a focused media bot, not a full general-pur
 ## Tech Stack
 
 - [Aiogram 3.x](https://docs.aiogram.dev/) for Telegram bot routing and FSM flows
-- [Google GenAI SDK](https://github.com/googleapis/python-genai) for Gemini API access
+- [Google GenAI SDK](https://github.com/googleapis/python-genai) for Gemini API access (default)
+- [Aporto](https://aporto.tech) — **optional** alternative for AI calls, see "Save with Aporto" below
 - `aiohttp` for webhook serving
 - `redis` as optional FSM storage
 - `texts.py` for bilingual UI copy
 - `config.py` for centralized runtime and model configuration
 
+## Save with Aporto (optional)
+
+This bot can route all of its AI calls — image generation, image editing, and
+voice transcription — through [**Aporto**](https://aporto.tech) instead of
+Google. Aporto gives you **one API key for many AI models** (image, video,
+audio, search, and more) and applies **discounted routed pricing on eligible
+models, up to 60% off** compared to going direct.
+
+New accounts on Aporto receive **up to $3 in free credit** to try it out — no
+credit card required for the trial.
+
+To opt in:
+
+1. Sign up at <https://aporto.tech> (free, takes a minute — you'll get the
+   starter credit automatically).
+2. Grab an API key from <https://app.aporto.tech/settings>.
+3. Add it to your `.env`:
+   ```env
+   APORTO_API_KEY=***   ```
+4. (Optional) Remove or leave your `GOOGLE_API_KEY` — Aporto takes over
+   automatically when `APORTO_API_KEY` is set. If both are set, Aporto wins.
+
+That's it — no code changes, no SDK installs, the bot picks the new
+provider on the next start. If you ever want to switch back, just unset
+`APORTO_API_KEY` and restart.
+
+The same handler code keeps working with both backends, so you can compare
+quality and cost per request before committing.
+
+### How the integration works
+
+- `aporto_client.py` is a thin optional wrapper. It is only loaded when
+  `APORTO_API_KEY` is set.
+- Inside `bot.py`, the three AI call-sites are implemented as plain async
+  functions (`generate_image_from_text`, `edit_image_with_prompt`,
+  `transcribe_audio`). When Aporto is enabled, those names are reassigned
+  to the Aporto implementations at startup — no handler code, no FSM, and
+  no other logic in the bot changes.
+- Aporto skill IDs are pinned in `aporto_client.py` after a one-time
+  integration-time discovery step. End users never run discovery.
+
+### Maintainer attribution (for the original repo author)
+
+The Aporto SDK accepts a maintainer `INTEGRATION_ID` so that usage from
+this repository can be attributed to the author according to Aporto's
+referral program terms. **This is not a secret and not an env var.**
+
+To enable referral attribution for yourself as the maintainer of this repo:
+
+1. Open the Aporto Dashboard at <https://app.aporto.tech>.
+2. Create or copy your integration ID (it is public, not an API key).
+3. Open `aporto_client.py` and replace the placeholder:
+   ```python
+   INTEGRATION_ID = "YOUR_APORTO_INTEGRATION_ID"
+   ```
+   with your real value.
+
+End users of the bot do not need to set anything for attribution — only
+`APORTO_API_KEY` is required at runtime.
+
 ## Project Layout
 
 ```text
 .
-├── bot.py           # Telegram handlers and Gemini workflow logic
-├── config.py        # Environment loading and model configuration
-├── texts.py         # Localized user-facing strings
-├── assets/          # README screenshots
+├── bot.py                 # Telegram handlers and workflow logic
+├── config.py              # Environment loading and model configuration
+├── aporto_client.py       # Optional Aporto wrapper (lazy-loaded when APORTO_API_KEY is set)
+├── texts.py               # Localized user-facing strings
+├── assets/                # README screenshots
 └── requirements.txt
 ```
 
@@ -77,8 +139,11 @@ pip install -r requirements.txt
 Create a `.env` file next to `bot.py`:
 
 ```env
-TELEGRAM_BOT_TOKEN=your_token_from_@BotFather
-GOOGLE_API_KEY=your_key_from_Google_AI_Studio
+TELEGRAM_BOT_TOKEN=*** AI key (preferred for Aporto's $3 trial credit). Get one at
+# https://app.aporto.tech/settings. Routes all AI calls through Aporto.
+APORTO_API_KEY=*** AI provider (fallback): Google Gemini. Required if
+# APORTO_API_KEY is not set.
+# GOOGLE_API_KEY=*** list of Telegram user IDs
 ALLOWED_USERS=123456789,987654321
 
 # Optional: webhook mode
