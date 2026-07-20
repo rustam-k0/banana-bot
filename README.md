@@ -1,68 +1,32 @@
-# 🍌 Banana Bot
+# Banana Mate 🍌
 
-Production-oriented Telegram assistant built with Python and aiogram 3. It supports concise chat, complex tasks, image generation and editing, file analysis, translation, voice input, bounded conversation memory, provider fallback, and operational statistics.
+**A friendly AI assistant that lives in Telegram.** Ask questions, send voice messages, translate text, understand files, and create or edit images—without teaching anyone a new app.
 
-![Banana Bot result demo](assets/telegram-demo-result.jpg)
+Banana Mate is an open-source starter for developers who want to give family, friends, or customers a simple AI experience inside a familiar messenger.
 
-## User flows
+<p align="center">
+  <img src="assets/banana-mate-avatar.png" width="220" alt="Banana Mate avatar">
+</p>
 
-- `💬 Chat` — concise answers through the fast chat chain (Luna by default).
-- `🧠 Complex task` — deeper reasoning through the complex chain (Sol by default).
-- `🎨 Generate image` — fast xAI images or PRO images through GPT Image.
-- `🪄 Edit image` — edit a Telegram photo using the selected image quality.
-- `📎 Analyze file` — summarize a document and extract facts, risks, and actions.
-- `🌐 Translate` — balanced translation through Terra by default.
-- `🆕 New conversation` — clear messages, rolling summary, and saved facts.
-- `⚙️ Settings` — choose fast/balanced/complex chat and fast/PRO images.
-- `Подробнее / More` — request an expanded answer with a larger output limit.
-- `🔊 Озвучить / Listen` — turn an existing text answer into a Telegram voice message on demand.
+## What people can do
 
-## Model routing
+- ask everyday questions by text or voice;
+- get a deeper answer for harder tasks;
+- translate text and voice messages;
+- summarize and explain files;
+- create images or edit a photo;
+- listen to answers as Telegram voice messages;
+- start a fresh conversation at any time.
 
-Every chain is configurable as a comma-separated list of `provider:model` targets. Providers without an API key are skipped. Configuration is validated before Telegram polling or webhook startup; startup fails clearly when a required chain has no usable provider.
+The interface is available in Russian and English. Answers are short by default; **More** expands them when needed.
 
-| Workload | Default primary | Default fallback |
-| --- | --- | --- |
-| Regular chat | OpenAI `gpt-5.6-luna` | Google `gemini-3.5-flash` |
-| Balanced chat / translation | OpenAI `gpt-5.6-terra` | Google `gemini-3.5-flash` |
-| Complex tasks | OpenAI `gpt-5.6-sol` | Google `gemini-3.5-pro` |
-| PRO image | OpenAI `gpt-image-2` | Google `gemini-3.1-flash-image` |
-| Fast image | xAI `grok-imagine-image-quality` | Google `gemini-3.1-flash-image` |
-| Transcription | OpenAI `gpt-4o-mini-transcribe` | Google `gemini-3.5-flash` |
-| Voice reply | OpenAI `tts-1` (configurable) | — |
+## Fastest setup
 
-Safety-policy errors do not fall through to another provider. Transient HTTP failures, timeouts, rate limits, and empty provider responses do.
-
-## Memory and response limits
-
-Conversation context contains only:
-
-- the latest 8 user/assistant messages;
-- a bounded rolling summary of evicted messages;
-- up to 20 explicitly saved facts (`Remember: …` / `Запомни: …`).
-
-Normal answers use `MAX_OUTPUT_TOKENS=700`; the More button uses `DETAILED_OUTPUT_TOKENS=1800`. New conversation clears all three memory layers.
-
-## Architecture
-
-```text
-banana_bot/
-├── adapters/          # OpenAI, xAI, and Google wire formats
-├── routers/           # common, text, media, and admin Telegram routing
-├── services/          # provider-independent orchestration and fallback
-├── app.py             # dependency wiring, polling, and webhook lifecycle
-├── config.py          # environment parsing and startup validation
-├── http.py            # shared async client, timeout, retry, rate limit
-├── i18n.py            # RU/EN interface text
-├── memory.py          # bounded messages, summary, saved facts
-└── observability.py   # structured safe logs and in-process metrics
-```
-
-The top-level `bot.py`, `config.py`, and `texts.py` remain compatibility entrypoints for existing deployments and imports.
-
-## Setup
+You need Python 3.11+, a Telegram bot token from [@BotFather](https://t.me/BotFather), and API access to at least one provider.
 
 ```bash
+git clone https://github.com/rustam-k0/banana-bot.git
+cd banana-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -70,39 +34,106 @@ cp .env.example .env
 python bot.py
 ```
 
-Existing variables remain supported: `TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GOOGLE_API_KEY`, `ALLOWED_USERS`, `WEBHOOK_URL`, `PORT`, and `REDIS_URL`.
+For the smallest working configuration, add these values to `.env`:
 
-If `WEBHOOK_URL` is absent, the bot uses long polling. If `ALLOWED_USERS` is empty, access is public. `ADMIN_USERS` defaults to the whitelist when omitted.
+```env
+TELEGRAM_BOT_TOKEN=your_telegram_token
+GOOGLE_API_KEY=your_google_key
+```
 
-## Observability and admin stats
+Add `OPENAI_API_KEY` for OpenAI chat, PRO images, transcription, and voice replies. Add `XAI_API_KEY` for fast image generation.
 
-Logs are structured and include operation, provider, model, status, and error type. Prompt/file contents, authorization headers, API keys, and provider error bodies are not logged.
+## Deploy on Render
 
-Administrators can run `/admin_stats` to see:
+1. Fork this repository.
+2. Create a Render Blueprint from your fork. Render reads `render.yaml`.
+3. Add `TELEGRAM_BOT_TOKEN` and provider keys in **Service → Environment**.
+4. Deploy.
 
-- active user count and request volume;
-- calls and errors by provider/model;
-- average latency;
-- input/output token totals;
-- approximate cost (an estimate, not a billing source of truth).
+`/healthz` works in both webhook and polling modes. Local `.env` files are ignored and never uploaded to Render.
 
-Metrics are process-local and reset on restart. Redis is currently used for Telegram FSM persistence; the conversation-memory interface is intentionally storage-agnostic so a persistent implementation can be added without changing routers.
+## Make it yours
 
-## Tests
+Most adaptations only require three files:
 
-The suite uses mocked provider APIs and never needs real keys:
+| Change | File |
+| --- | --- |
+| Bot name, welcome text, buttons | `banana_bot/i18n.py` |
+| Models, providers, limits | `.env` |
+| Avatar | `assets/banana-mate-avatar.png` |
+
+Suggested [@BotFather](https://t.me/BotFather) profile:
+
+**Name**
+
+`Banana Mate 🍌`
+
+**Short description — RU**
+
+`Дружелюбный AI-помощник в Telegram: вопросы, голос, перевод, файлы и изображения.`
+
+**Short description — EN**
+
+`A friendly Telegram AI for questions, voice, translation, files, and images.`
+
+**Description — RU**
+
+`Просто напишите или отправьте голосовое сообщение. Banana Mate поможет разобраться в вопросе, перевести текст, понять файл, создать изображение или изменить фото — прямо в Telegram.`
+
+**Description — EN**
+
+`Type or send a voice message. Banana Mate can answer questions, translate text, explain files, create images, and edit photos—right inside Telegram.`
+
+The generated avatar is ready at [`assets/banana-mate-avatar.png`](assets/banana-mate-avatar.png).
+
+## Models and fallbacks
+
+Model chains use `provider:model,provider:model` syntax and are checked at startup.
+
+| Task | Default route |
+| --- | --- |
+| Quick chat | OpenAI Luna → Google |
+| Detailed chat and translation | OpenAI Terra → Google |
+| Deep tasks | OpenAI Sol → Google |
+| Fast images | xAI → Google |
+| PRO images | GPT Image → Google |
+| Voice input | OpenAI Transcribe → Google |
+| Voice reply | OpenAI TTS |
+
+Change any route in `.env`; see [`.env.example`](.env.example) for every option.
+
+## Memory and privacy
+
+The bot sends only a bounded context to providers:
+
+- the latest 8 messages;
+- a short rolling summary;
+- facts explicitly saved with `Remember:` or `Запомни:`.
+
+Safe structured logs contain model, latency, token, and error metadata—not prompts, files, API keys, or provider responses. `/admin_stats` shows process-local usage and approximate cost to users listed in `ADMIN_USERS`.
+
+## Project map
+
+```text
+banana_bot/
+├── adapters/       # OpenAI, xAI, Google
+├── routers/        # Telegram commands and media flows
+├── services/       # routing, retries, fallbacks
+├── app.py          # startup, webhook, polling, health checks
+├── config.py       # environment validation
+├── i18n.py         # RU/EN content and button labels
+├── memory.py       # bounded conversation context
+└── observability.py
+```
+
+`bot.py` remains the stable entrypoint. Redis is optional and stores Telegram FSM state when `REDIS_URL` is set.
+
+## Verify changes
+
+Tests use mocked APIs and do not spend provider credits:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-It covers configuration compatibility and validation, exact memory bounds, model selection, fallback and safety behavior, OpenAI/Google payload contracts, and Telegram router wiring.
-
-## Deployment notes
-
-- Keep `.env` out of version control; it is ignored by this repository.
-- Render does not receive your local `.env`. Add `TELEGRAM_BOT_TOKEN` and the provider keys in **Service → Environment**. At least one configured provider must be available in every model chain.
-- [`render.yaml`](render.yaml) declares the build/start commands, secret placeholders, Python version, and `/healthz` check. Polling mode also opens `PORT`, so a Render web service remains healthy without webhook mode.
-- Set `REDIS_URL` for persistent FSM state across restarts or multiple workers.
-- Tune `RATE_LIMIT_PER_MINUTE`, timeouts, retries, and token limits for provider quotas.
-- The shared rate limit is per bot process. Use an external distributed limiter when running multiple replicas.
+Before making the bot public, review provider quotas, `ALLOWED_USERS`, `ADMIN_USERS`, token limits, and your privacy notice.

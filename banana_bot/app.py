@@ -52,6 +52,19 @@ def build_dispatcher(config: AppConfig, ai: AIService, memory: ConversationMemor
     return dispatcher
 
 
+async def configure_webhook(bot: Bot, dispatcher: Dispatcher, webhook_url: str, secret: str) -> list[str]:
+    # Telegram reuses the previous allowed_updates value when it is omitted.
+    # Resolve it from registered handlers so inline buttons cannot silently stop arriving.
+    allowed_updates = dispatcher.resolve_used_update_types()
+    await bot.set_webhook(
+        f"{webhook_url.rstrip('/')}/webhook",
+        secret_token=secret,
+        allowed_updates=allowed_updates,
+    )
+    log_event("webhook_ready", allowed_updates=allowed_updates)
+    return allowed_updates
+
+
 async def run(config: AppConfig) -> None:
     config.validate()
     logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -87,7 +100,7 @@ async def run(config: AppConfig) -> None:
             secret = config.telegram_bot_token.replace(":", "")
             SimpleRequestHandler(dispatcher=dispatcher, bot=bot, secret_token=secret).register(app, path="/webhook")
             setup_application(app, dispatcher, bot=bot)
-            await bot.set_webhook(f"{config.webhook_url.rstrip('/')}/webhook", secret_token=secret)
+            await configure_webhook(bot, dispatcher, config.webhook_url, secret)
             runner = web.AppRunner(app); await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", config.port).start()
             await asyncio.Event().wait()

@@ -7,6 +7,7 @@ from banana_bot.formatting import chunks, telegram_html
 from banana_bot.http import ProviderError
 from banana_bot.i18n import button_values, text
 from banana_bot.keyboards import detail_keyboard, main_keyboard
+from banana_bot.observability import log_event
 from banana_bot.services.ai import AIService
 from banana_bot.states import BotStates
 
@@ -65,6 +66,7 @@ def build_text_router(ai: AIService) -> Router:
 
     @router.callback_query(F.data == "answer:detail")
     async def detail(callback: CallbackQuery, state: FSMContext) -> None:
+        log_event("callback_received", action="detail", user_id=callback.from_user.id)
         data = await state.get_data()
         lang = data.get("lang", "EN")
         if not data.get("last_request") or not callback.message:
@@ -77,11 +79,16 @@ def build_text_router(ai: AIService) -> Router:
             result = await ai.chat(callback.from_user.id, prompt, data.get("last_mode", "balanced"), detailed=True)
             await status.delete()
             await send_result(callback.message, result.text, lang)
-        except ProviderError:
+        except ProviderError as exc:
+            log_event("callback_failure", action="detail", status=exc.status, code=exc.code)
+            await status.edit_text(text(lang, "ERR_SERVER"))
+        except Exception as exc:
+            log_event("callback_failure", action="detail", error_type=type(exc).__name__)
             await status.edit_text(text(lang, "ERR_SERVER"))
 
     @router.callback_query(F.data == "answer:speak")
     async def speak(callback: CallbackQuery, state: FSMContext) -> None:
+        log_event("callback_received", action="speak", user_id=callback.from_user.id)
         data = await state.get_data()
         lang = data.get("lang", "EN")
         if not callback.message or not callback.message.text:
@@ -93,7 +100,11 @@ def build_text_router(ai: AIService) -> Router:
             result = await ai.synthesize(callback.message.text)
             await callback.message.answer_voice(types.BufferedInputFile(result.content, filename="answer.ogg"))
             await status.delete()
-        except ProviderError:
+        except ProviderError as exc:
+            log_event("callback_failure", action="speak", status=exc.status, code=exc.code)
+            await status.edit_text(text(lang, "VOICE_ERROR"))
+        except Exception as exc:
+            log_event("callback_failure", action="speak", error_type=type(exc).__name__)
             await status.edit_text(text(lang, "VOICE_ERROR"))
 
     return router
