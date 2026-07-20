@@ -53,6 +53,8 @@ class AppConfig:
     image_fast_chain: tuple[ModelTarget, ...]
     transcription_chain: tuple[ModelTarget, ...]
     file_analysis_chain: tuple[ModelTarget, ...]
+    speech_chain: tuple[ModelTarget, ...]
+    speech_voice: str
     request_timeout_seconds: float
     connect_timeout_seconds: float
     http_retries: int
@@ -92,6 +94,10 @@ class AppConfig:
                 raise ConfigError(f"{name} contains unsupported providers: {sorted(unknown)}")
             if not self.enabled_chain(chain):
                 raise ConfigError(f"{name} has no provider with a configured API key")
+        speech_providers = {target.provider for target in self.speech_chain}
+        unknown_speech = speech_providers - supported
+        if unknown_speech:
+            raise ConfigError(f"SPEECH_CHAIN contains unsupported providers: {sorted(unknown_speech)}")
         if self.memory_messages != 8:
             raise ConfigError("MEMORY_MESSAGES must be 8 to enforce the bounded-memory contract")
         if self.http_retries < 0 or self.rate_limit_per_minute < 1:
@@ -124,6 +130,8 @@ def load_config(env: Mapping[str, str] | None = None, *, validate: bool = False)
         image_fast_chain=_chain(values, "IMAGE_FAST_CHAIN", "xai:grok-imagine-image-quality,google:gemini-3.1-flash-image", resolution="1k"),
         transcription_chain=_chain(values, "TRANSCRIPTION_CHAIN", "openai:gpt-4o-mini-transcribe,google:gemini-3.5-flash"),
         file_analysis_chain=_chain(values, "FILE_ANALYSIS_CHAIN", "openai:gpt-5.6-terra,google:gemini-3.5-flash"),
+        speech_chain=_chain(values, "SPEECH_CHAIN", "openai:tts-1"),
+        speech_voice=values.get("SPEECH_VOICE", "alloy"),
         request_timeout_seconds=float(values.get("REQUEST_TIMEOUT_SECONDS", "180")),
         connect_timeout_seconds=float(values.get("CONNECT_TIMEOUT_SECONDS", "10")),
         http_retries=int(values.get("HTTP_RETRIES", "2")),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from aiohttp import FormData
 
-from banana_bot.domain import ImageResult, TextResult, Usage
+from banana_bot.domain import AudioResult, ImageResult, TextResult, Usage
 from banana_bot.http import AsyncHTTPClient, ProviderError
 
 
@@ -69,3 +69,14 @@ class OpenAIAdapter:
             {"type": "input_file", "filename": "document", "file_data": f"data:{mime_type};base64,{encoded}"},
             {"type": "input_text", "text": prompt},
         ]}], max_tokens)  # type: ignore[list-item]
+
+    async def synthesize(self, model: str, text: str, voice: str) -> AudioResult:
+        content = await self.client.request_bytes(
+            "POST",
+            f"{self.base_url}/audio/speech",
+            headers=self.headers,
+            json={"model": model, "input": text, "voice": voice, "response_format": "opus"},
+        )
+        if not content:
+            raise ProviderError(502, "Provider returned no audio")
+        return AudioResult(content, self.provider, model)

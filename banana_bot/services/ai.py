@@ -5,7 +5,7 @@ from typing import Awaitable, Callable, TypeVar
 
 from banana_bot.adapters.base import AIAdapter
 from banana_bot.config import AppConfig, ModelTarget
-from banana_bot.domain import ImageResult, TextResult
+from banana_bot.domain import AudioResult, ImageResult, TextResult
 from banana_bot.http import ProviderError
 from banana_bot.memory import ConversationMemory
 from banana_bot.observability import Metrics, log_event
@@ -64,3 +64,13 @@ class AIService:
 
     async def analyze_file(self, content: bytes, mime_type: str, prompt: str) -> TextResult:
         return await self._fallback("analyze_file", self.config.file_analysis_chain, lambda adapter, target: adapter.analyze_file(target.model, content, mime_type, prompt, self.config.max_output_tokens))
+
+    async def synthesize(self, text: str) -> AudioResult:
+        spoken_text = text.strip()[:3500]
+        if not spoken_text:
+            raise ProviderError(400, "There is no text to synthesize")
+        return await self._fallback(
+            "synthesize",
+            self.config.speech_chain,
+            lambda adapter, target: adapter.synthesize(target.model, spoken_text, self.config.speech_voice),
+        )

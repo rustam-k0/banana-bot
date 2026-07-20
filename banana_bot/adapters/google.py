@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
-from banana_bot.domain import ImageResult, TextResult, Usage
+from banana_bot.domain import AudioResult, ImageResult, TextResult, Usage
 from banana_bot.http import AsyncHTTPClient, ProviderError
 
 
@@ -55,3 +55,6 @@ class GoogleAdapter:
         payload = await self._generate(model, [{"parts": [{"inlineData": {"mimeType": mime_type, "data": base64.b64encode(content).decode("ascii")}}, {"text": prompt}]}], max_tokens)
         text = "".join(part.get("text", "") for part in self._parts(payload))
         return TextResult(text, self.provider, model)
+
+    async def synthesize(self, model: str, text: str, voice: str) -> AudioResult:
+        raise ProviderError(400, "Google speech synthesis is not configured")
