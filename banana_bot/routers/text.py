@@ -1,5 +1,6 @@
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
+from aiogram import types
 from aiogram.types import CallbackQuery, Message
 
 from banana_bot.formatting import chunks, telegram_html
@@ -78,5 +79,21 @@ def build_text_router(ai: AIService) -> Router:
             await send_result(callback.message, result.text, lang)
         except ProviderError:
             await status.edit_text(text(lang, "ERR_SERVER"))
+
+    @router.callback_query(F.data == "answer:speak")
+    async def speak(callback: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        lang = data.get("lang", "EN")
+        if not callback.message or not callback.message.text:
+            await callback.answer(text(lang, "VOICE_ERROR"), show_alert=True)
+            return
+        await callback.answer()
+        status = await callback.message.answer(text(lang, "VOICE_PROCESSING"))
+        try:
+            result = await ai.synthesize(callback.message.text)
+            await callback.message.answer_voice(types.BufferedInputFile(result.content, filename="answer.ogg"))
+            await status.delete()
+        except ProviderError:
+            await status.edit_text(text(lang, "VOICE_ERROR"))
 
     return router

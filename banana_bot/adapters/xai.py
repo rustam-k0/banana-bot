@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 
-from banana_bot.domain import ImageResult, TextResult, Usage
+from banana_bot.domain import AudioResult, ImageResult, TextResult, Usage
 from banana_bot.http import AsyncHTTPClient, ProviderError
 
 
@@ -45,3 +45,6 @@ class XAIAdapter:
 
     async def analyze_file(self, model: str, content: bytes, mime_type: str, prompt: str, max_tokens: int) -> TextResult:
         raise ProviderError(400, "xAI file analysis is not configured")
+
+    async def synthesize(self, model: str, text: str, voice: str) -> AudioResult:
+        raise ProviderError(400, "xAI speech synthesis is not configured")

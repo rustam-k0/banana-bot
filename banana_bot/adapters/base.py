@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from banana_bot.domain import ImageResult, TextResult
+from banana_bot.domain import AudioResult, ImageResult, TextResult
 
 
 class AIAdapter(Protocol):
@@ -13,3 +13,4 @@ class AIAdapter(Protocol):
     async def edit_image(self, model: str, image: bytes, prompt: str, options: dict[str, str]) -> ImageResult: ...
     async def transcribe(self, model: str, audio: bytes) -> TextResult: ...
     async def analyze_file(self, model: str, content: bytes, mime_type: str, prompt: str, max_tokens: int) -> TextResult: ...
+    async def synthesize(self, model: str, text: str, voice: str) -> AudioResult: ...

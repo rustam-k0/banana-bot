@@ -25,4 +25,8 @@ def settings_keyboard(lang: str) -> ReplyKeyboardMarkup:
 
 
 def detail_keyboard(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=TEXTS[lang]["DETAIL_EN"] if lang == "EN" else TEXTS[lang]["DETAIL"], callback_data="answer:detail")]])
+    detail = TEXTS[lang]["DETAIL_EN"] if lang == "EN" else TEXTS[lang]["DETAIL"]
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=detail, callback_data="answer:detail"),
+        InlineKeyboardButton(text=TEXTS[lang]["SPEAK"], callback_data="answer:speak"),
+    ]])

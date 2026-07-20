@@ -106,3 +106,38 @@ class AsyncHTTPClient:
             if response.status >= 400:
                 raise ProviderError(response.status, "Could not download provider media")
             return await response.read()
+
+    async def request_bytes(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json: Any = None,
+    ) -> bytes:
+        await self.start()
+        assert self._session is not None
+        for attempt in range(self._retries + 1):
+            await self._limiter.acquire()
+            try:
+                async with self._session.request(method, url, headers=headers, json=json) as response:
+                    if response.status >= 400:
+                        try:
+                            payload = await response.json(content_type=None)
+                            error = payload.get("error", payload)
+                        except Exception:
+                            error = {"message": "Provider audio request failed"}
+                        message = error.get("message", "Provider audio request failed") if isinstance(error, dict) else str(error)
+                        code = error.get("code") if isinstance(error, dict) else None
+                        exc = ProviderError(response.status, message, code)
+                        if exc.safety_related or not exc.retryable or attempt == self._retries:
+                            raise exc
+                    else:
+                        return await response.read()
+            except ProviderError:
+                raise
+            except (ClientError, TimeoutError, OSError) as exc:
+                if attempt == self._retries:
+                    raise ProviderError(503, "Provider audio connection failed") from exc
+            await asyncio.sleep((2**attempt) * 0.25 + random.random() * 0.1)
+        raise ProviderError(503, "Provider audio request failed")

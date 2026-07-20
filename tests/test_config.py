@@ -19,6 +19,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.chat_complex_chain[0].model, "gpt-5.6-sol")
         self.assertEqual(config.image_pro_chain[0].model, "gpt-image-2")
         self.assertEqual(config.image_fast_chain[0].provider, "xai")
+        self.assertEqual(config.speech_chain[0].model, "tts-1")
 
     def test_existing_environment_names_remain_supported(self):
         config = load_config({**BASE_ENV, "ALLOWED_USERS": "1, 2,invalid", "PORT": "9000"})

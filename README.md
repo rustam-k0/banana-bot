@@ -15,6 +15,7 @@ Production-oriented Telegram assistant built with Python and aiogram 3. It suppo
 - `🆕 New conversation` — clear messages, rolling summary, and saved facts.
 - `⚙️ Settings` — choose fast/balanced/complex chat and fast/PRO images.
 - `Подробнее / More` — request an expanded answer with a larger output limit.
+- `🔊 Озвучить / Listen` — turn an existing text answer into a Telegram voice message on demand.
 
 ## Model routing
 
@@ -28,6 +29,7 @@ Every chain is configurable as a comma-separated list of `provider:model` target
 | PRO image | OpenAI `gpt-image-2` | Google `gemini-3.1-flash-image` |
 | Fast image | xAI `grok-imagine-image-quality` | Google `gemini-3.1-flash-image` |
 | Transcription | OpenAI `gpt-4o-mini-transcribe` | Google `gemini-3.5-flash` |
+| Voice reply | OpenAI `tts-1` (configurable) | — |
 
 Safety-policy errors do not fall through to another provider. Transient HTTP failures, timeouts, rate limits, and empty provider responses do.
 

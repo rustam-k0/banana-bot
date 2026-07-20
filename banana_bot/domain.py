@@ -22,3 +22,10 @@ class ImageResult:
     content: bytes
     provider: str
     model: str
+
+
+@dataclass(frozen=True)
+class AudioResult:
+    content: bytes
+    provider: str
+    model: str

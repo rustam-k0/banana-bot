@@ -17,6 +17,10 @@ class MockHTTPClient:
     async def download(self, url):
         return b"downloaded"
 
+    async def request_bytes(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        return b"opus-audio"
+
 
 class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_openai_responses_contract_and_usage(self):
@@ -35,6 +39,14 @@ class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.image("backup-image", "banana", {})
         self.assertEqual(result.content, b"image-bytes")
         self.assertIn("backup-image:generateContent", http.requests[0][1])
+
+    async def test_openai_speech_uses_opus_for_telegram_voice(self):
+        http = MockHTTPClient({})
+        adapter = OpenAIAdapter(http, "not-a-real-key")
+        result = await adapter.synthesize("tts-1", "Привет", "alloy")
+        self.assertEqual(result.content, b"opus-audio")
+        self.assertTrue(http.requests[0][1].endswith("/audio/speech"))
+        self.assertEqual(http.requests[0][2]["json"]["response_format"], "opus")
 
 
 if __name__ == "__main__":

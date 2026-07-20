@@ -40,6 +40,7 @@ TEXTS = {
         "ERR_UNKNOWN": "⚙️ The request could not be completed.", "ERR_DL_TELEGRAM": "Could not download the Telegram file.",
         "DETAIL": "Подробнее", "DETAIL_EN": "More", "DETAIL_PROMPT": "Expand your previous answer with useful detail, examples, and caveats.",
         "NO_DETAIL": "There is no previous answer to expand.", "ADMIN_DENIED": "This command is available to administrators only.",
+        "SPEAK": "🔊 Listen", "VOICE_PROCESSING": "🔊 Creating voice reply…", "VOICE_ERROR": "Could not create the voice reply.",
     },
     "RU": {
         "BTN_CHAT": "💬 Обычный чат", "BTN_COMPLEX": "🧠 Сложная задача",
@@ -79,6 +80,7 @@ TEXTS = {
         "ERR_UNKNOWN": "⚙️ Не удалось выполнить запрос.", "ERR_DL_TELEGRAM": "Не удалось загрузить файл из Telegram.",
         "DETAIL": "Подробнее", "DETAIL_EN": "More", "DETAIL_PROMPT": "Раскрой предыдущий ответ подробнее: добавь полезные детали, примеры и важные оговорки.",
         "NO_DETAIL": "Пока нет ответа, который можно раскрыть подробнее.", "ADMIN_DENIED": "Команда доступна только администраторам.",
+        "SPEAK": "🔊 Озвучить", "VOICE_PROCESSING": "🔊 Создаю голосовой ответ…", "VOICE_ERROR": "Не удалось создать голосовой ответ.",
     },
 }
 
