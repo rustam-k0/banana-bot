@@ -52,6 +52,12 @@ Add `OPENAI_API_KEY` for OpenAI chat, PRO images, transcription, and voice repli
 
 `/healthz` works in both webhook and polling modes. Local `.env` files are ignored and never uploaded to Render.
 
+## Deploy on a VPS
+
+The `production` branch can deploy automatically through GitHub Actions. The VPS runs the bot as an unprivileged `deploy` user under systemd, while API keys stay only in `/opt/banana-bot/.env`.
+
+Deployment assets are in `deploy/`. A push to `production` runs the test suite, connects to the VPS with a dedicated SSH key, fast-forwards the checkout, installs dependencies, restarts the service, and verifies `/healthz`.
+
 ## Make it yours
 
 Most adaptations only require three files:
