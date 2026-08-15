@@ -21,8 +21,15 @@ git merge --ff-only "origin/${BRANCH}"
 
 sudo /usr/bin/systemctl restart banana-bot.service
 
+health_port="$(sed -n 's/^PORT=//p' "${APP_DIR}/.env" | tail -n 1)"
+health_port="${health_port:-8080}"
+if [[ ! "${health_port}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid PORT value in ${APP_DIR}/.env" >&2
+  exit 1
+fi
+
 for attempt in {1..15}; do
-  if curl --fail --silent --show-error http://127.0.0.1:8080/healthz >/dev/null; then
+  if curl --fail --silent --show-error "http://127.0.0.1:${health_port}/healthz" >/dev/null; then
     echo "Deployment completed successfully"
     exit 0
   fi
